@@ -7,5 +7,6 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 
 # 添加源文件
 file(GLOB_RECURSE SOURCES "main/*.c")
+# set(EXTRA_COMPONENT_DIRS "components")
 
 project(lcd_camera)

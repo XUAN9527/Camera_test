@@ -3,9 +3,9 @@
 # ENDIF()
 idf_component_register(
     SRCS
-    "main.c"    
-    "lcd_camera.c"
-        "img_convert.c"
+        "main.c"    
+        "lcd_camera.c"
         "softap_sta.c"
+        "udp_transmitter"
     INCLUDE_DIRS
         ".")

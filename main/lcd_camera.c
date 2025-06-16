@@ -1,39 +1,25 @@
-/* LCD Camera loop display example
-
-   This example code is in the Public Domain (or CC0 licensed, at your option.)
-
-   Unless required by applicable law or agreed to in writing, this
-   software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
-   CONDITIONS OF ANY KIND, either express or implied.
-*/
+/* LCD Camera with AP UDP Streaming - RGB565 Only */
 #include <stdio.h>
-#include "string.h"
+#include <string.h>
 #include "esp_log.h"
 #include "board.h"
 #include "audio_mem.h"
+#include "esp_camera.h"
+#include "esp_lcd_panel_ops.h"
+#include "freertos/queue.h"
+#include "udp_transmitter.h"
 #include "esp_jpeg_common.h"
-#include "img_convert.h"
-#include "softap_sta.h"
 
 static const char *TAG = "LCD_Camera";
 
-#if (ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(4, 4, 0))
-#error "The esp_lcd APIs support on idf v4.4 and later"
-#endif
-#include "esp_lcd_panel_ops.h"
-#include "esp_camera.h"
+// 显示分辨率
+#define EXAMPLE_LCD_H_RES   320
+#define EXAMPLE_LCD_V_RES   240
 
-#define EXAMPLE_LCD_H_RES    (320)
-#define EXAMPLE_LCD_V_RES    (240)
+// 图像队列 - 用于UDP传输
+static QueueHandle_t image_queue = NULL;
 
-#if defined CONFIG_CAMERA_DATA_FORMAT_YUV422
-static const pixformat_t s_camera_format = PIXFORMAT_YUV422;
-#else
-static const pixformat_t s_camera_format = PIXFORMAT_RGB565;
-#endif // CONFIG_CAMERA_DATA_FORMAT_YUV422
-
-static uint8_t *rgb_buffer;
-
+// 摄像头配置 - 仅使用RGB565
 static camera_config_t camera_config = {
     .pin_pwdn = CAM_PIN_PWDN,
     .pin_reset = CAM_PIN_RESET,
@@ -53,27 +39,25 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    //XCLK 20MHz or 10MHz for OV2640 double FPS (Experimental)
     .xclk_freq_hz = 40000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
-    .pixel_format = s_camera_format, //YUV422,GRAYSCALE,RGB565,JPEG
-    .frame_size = FRAMESIZE_QVGA,    //QQVGA-UXGA Do not use sizes above QVGA when not JPEG
-
-    .jpeg_quality = 12,            //0-63 lower number means higher quality
-    .fb_count = 2,                 //if more than one, i2s runs in continuous mode. Use only with JPEG
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+    .pixel_format = PIXFORMAT_RGB565,  // 仅使用RGB565格式
+    .frame_size = FRAMESIZE_QVGA,      // 320x240
+    .jpeg_quality = 12,                 // 不相关
+    .fb_count = 2,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,   // 总是获取最新帧
 };
 
 static esp_err_t init_camera()
 {
-    //initialize the camera
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera Init Failed");
+        ESP_LOGE(TAG, "Camera Init Failed: %s", esp_err_to_name(err));
         return err;
     }
-
+    
+    ESP_LOGI(TAG, "Camera initialized in RGB565 format");
     return ESP_OK;
 }
 
@@ -87,63 +71,72 @@ static esp_err_t example_lcd_rgb_draw(esp_lcd_panel_handle_t panel_handle, uint8
     return ESP_OK;
 }
 
-/* example: YUV422 -> RGB565 -> LCD */
-static esp_err_t example_lcd_yuv422_draw(esp_lcd_panel_handle_t panel_handle, uint8_t *image)
-{
-    jpeg_yuv2rgb(JPEG_SUBSAMPLE_422, JPEG_PIXEL_FORMAT_RGB565_BE, image, EXAMPLE_LCD_H_RES, EXAMPLE_LCD_V_RES, rgb_buffer);
-    example_lcd_rgb_draw(panel_handle, rgb_buffer);
-    return ESP_OK;
-}
-
 void my_lcd_camera_task(void *pvParameters)
 {
+    // 创建图像队列 (用于UDP传输)
+    image_queue = xQueueCreate(3, sizeof(camera_fb_t *));
+    if (!image_queue) {
+        ESP_LOGE(TAG, "Failed to create image queue");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // 启动UDP传输任务
+    xTaskCreate(udp_transmit_task, "udp_transmit", 4096, (void *)image_queue, 5, NULL);
+    ESP_LOGI(TAG, "UDP transmit task started");
+
+    // 初始化外设
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
-
-    // Because the current development board camera shares the i2c interface with the expansion chip.
-    // The expansion chip operation may be abnormal, so the camera is initialized in advance
+    
+    // 初始化摄像头
     if (ESP_OK != init_camera()) {
+        vTaskDelete(NULL);
         return;
     }
 
+    // 初始化LCD
     esp_lcd_panel_handle_t panel_handle = audio_board_lcd_init(set, NULL);
-
-    if (s_camera_format == PIXFORMAT_YUV422) {
-        rgb_buffer = audio_calloc(1, EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES * 2);
-        AUDIO_MEM_CHECK(TAG, rgb_buffer, return);
+    if (!panel_handle) {
+        ESP_LOGE(TAG, "LCD initialization failed");
+        vTaskDelete(NULL);
+        return;
     }
-
+    
     while (1) {
-        // ESP_LOGI(TAG, "Taking picture...");
+        ESP_LOGI(TAG, "Taking picture...");
+        // 获取摄像头帧
         camera_fb_t *pic = esp_camera_fb_get();
-
+        if (!pic) {
+            vTaskDelay(1); // 短暂让出CPU
+            continue;
+        }
+        
         // use pic->buf to access the image
-        // ESP_LOGI(TAG, "Picture taken! The size was: %zu bytes, w:%d, h:%d", pic->len, pic->width, pic->height);
+        ESP_LOGI(TAG, "Picture taken! The size was: %zu bytes, w:%d, h:%d", pic->len, pic->width, pic->height);
+        example_lcd_rgb_draw(panel_handle, pic->buf);
 
-        if (s_camera_format == PIXFORMAT_YUV422) {
-            example_lcd_yuv422_draw(panel_handle, pic->buf);
-        } else {
-            // PIXFORMAT_YUV565
-            example_lcd_rgb_draw(panel_handle, pic->buf);
+        // 将图像发送到UDP传输队列
+        if (xQueueSend(image_queue, &pic, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "UDP queue full, discarding frame");
+            esp_camera_fb_return(pic);
         }
 
-        // AUDIO_MEM_SHOW(TAG);
+        AUDIO_MEM_SHOW(TAG);
         esp_camera_fb_return(pic);
-    }
-
-    if (s_camera_format == PIXFORMAT_YUV422) {
-        audio_free(rgb_buffer);
+        vTaskDelay(2);
     }
 }
 
 void my_lcd_camera_init(void)
 {
-    xTaskCreate(
-        my_lcd_camera_task,      // 任务函数
-        "my_lcd_camera_task",       // 任务名称
-        4096,                    // 栈大小（单位：字节）
-        NULL,                     // 传递给任务的参数
-        5,                        // 任务优先级
-        NULL                      // 任务句柄
+    xTaskCreatePinnedToCore(
+        my_lcd_camera_task,
+        "cam_task",
+        4096,
+        NULL,
+        4,
+        NULL,
+        1  // 在APP核心运行
     );
 }

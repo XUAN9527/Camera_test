@@ -3,7 +3,7 @@ dependencies:
     component_hash: ecb1bf4963bd277e8adc891096b3a9f753175c6a8e667c2a94074fd61426053f
     dependencies: []
     source:
-      git: https://github.com/espressif/esp32-camera.git
+      git: git@github.com:espressif/esp32-camera.git
       path: .
       type: git
     version: 4467667b71f22a4c7db226f24105a9350abe7a05
@@ -18,7 +18,7 @@ dependencies:
       type: service
     version: 0.5.3
   espressif/dl_fft:
-    component_hash: fd1a95b07dabf8bde7d02e658b953516d2497b612b061f0d4b150fb755c65e62
+    component_hash: da00ee80aca795c33ed70e4489492ee87322a41814665890a485587340b680c3
     dependencies:
     - name: idf
       require: private
@@ -26,7 +26,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 0.1.0
+    version: 0.2.0
   espressif/esp-dsp:
     component_hash: 619639efc18cfa361a9e423739b9b0ffc14991effc6c027f955c2f2c3bf1754b
     dependencies:
@@ -105,6 +105,6 @@ direct_dependencies:
 - espressif/nghttp
 - espressif/zlib
 - idf
-manifest_hash: 48207615b56b0ead0f79d4355e0e11f60f186f39c1d41cb73119e8b8cded7c92
+manifest_hash: df64aeaf46959f5f153e2d736e2d53d96bc63bbb89cb9d1fe259441c3e687f27
 target: esp32s3
 version: 2.0.0

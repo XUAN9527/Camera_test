@@ -14,7 +14,7 @@
 extern "C" {
 #endif  /* __cplusplus */
 
-void my_softap_sta_init(void);
+void wifi_ap_udp_init(void);
 
 
 #ifdef __cplusplus
