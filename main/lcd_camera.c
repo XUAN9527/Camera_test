@@ -7,19 +7,19 @@
 #include "esp_camera.h"
 #include "esp_lcd_panel_ops.h"
 #include "freertos/queue.h"
-#include "udp_transmitter.h"
 #include "esp_jpeg_common.h"
+#include "esp_http_server.h"
+#include "esp_heap_caps.h"
+#include <inttypes.h>
 
 static const char *TAG = "LCD_Camera";
 
 // 显示分辨率
 #define EXAMPLE_LCD_H_RES   320
 #define EXAMPLE_LCD_V_RES   240
+#define EXAMPLE_FRAME_SIZE  8   // 降低帧率
 
-// 图像队列 - 用于UDP传输
-static QueueHandle_t image_queue = NULL;
-
-// 摄像头配置 - 仅使用RGB565
+// 摄像头配置
 static camera_config_t camera_config = {
     .pin_pwdn = CAM_PIN_PWDN,
     .pin_reset = CAM_PIN_RESET,
@@ -42,12 +42,132 @@ static camera_config_t camera_config = {
     .xclk_freq_hz = 40000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
-    .pixel_format = PIXFORMAT_RGB565,  // 仅使用RGB565格式
-    .frame_size = FRAMESIZE_QVGA,      // 320x240
-    .jpeg_quality = 12,                 // 不相关
+    .pixel_format = PIXFORMAT_RGB565,
+    .frame_size = FRAMESIZE_QVGA,
+    .jpeg_quality = 12,
     .fb_count = 2,
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,   // 总是获取最新帧
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
 };
+
+// HTTP服务器句柄
+static httpd_handle_t stream_httpd = NULL;
+
+// MJPEG流处理函数
+static esp_err_t stream_handler(httpd_req_t *req)
+{
+    camera_fb_t *fb = NULL;
+    esp_err_t res = ESP_OK;
+    char part_buf[128];
+
+    res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    while (true) {
+        fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Camera capture failed");
+            res = ESP_FAIL;
+            break;
+        }
+
+        uint8_t *jpeg_buf_ptr = NULL;
+        size_t jpeg_size = 0;
+
+        if (!frame2jpg(fb, 60, &jpeg_buf_ptr, &jpeg_size)) {
+            ESP_LOGE(TAG, "JPEG compression failed");
+            esp_camera_fb_return(fb);
+            continue;
+        }
+
+        int header_len = snprintf(part_buf, sizeof(part_buf),
+                                  "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                                  (unsigned int)jpeg_size);
+
+        if (header_len < 0 || header_len >= sizeof(part_buf)) {
+            ESP_LOGE(TAG, "Header formatting failed");
+            esp_camera_fb_return(fb);
+            free(jpeg_buf_ptr);
+            continue;
+        }
+
+        res = httpd_resp_send_chunk(req, part_buf, header_len);
+        if (res != ESP_OK) {
+            ESP_LOGW(TAG, "Send header failed: %s", esp_err_to_name(res));
+            esp_camera_fb_return(fb);
+            free(jpeg_buf_ptr);
+            break;
+        }
+
+        res = httpd_resp_send_chunk(req, (const char *)jpeg_buf_ptr, jpeg_size);
+        if (res != ESP_OK) {
+            ESP_LOGW(TAG, "Send image failed: %s", esp_err_to_name(res));
+            esp_camera_fb_return(fb);
+            free(jpeg_buf_ptr);
+            break;
+        }
+
+        res = httpd_resp_send_chunk(req, "\r\n", 2);
+        if (res != ESP_OK) {
+            ESP_LOGW(TAG, "Send frame end failed: %s", esp_err_to_name(res));
+            esp_camera_fb_return(fb);
+            free(jpeg_buf_ptr);
+            break;
+        }
+
+        esp_camera_fb_return(fb);
+        free(jpeg_buf_ptr);
+
+        vTaskDelay(pdMS_TO_TICKS(1000 / EXAMPLE_FRAME_SIZE));
+    }
+
+    if (fb) {
+        esp_camera_fb_return(fb);
+    }
+
+    return res;
+}
+
+// 首页 HTML
+static esp_err_t index_handler(httpd_req_t *req)
+{
+    const char *html = "<html><head><title>ESP32 Camera</title></head>"
+                       "<body><h1>ESP32 Camera</h1><img src=\"/stream\"></body></html>";
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, html, strlen(html));
+}
+
+// 启动 HTTPD
+static void start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.ctrl_port = 32760;
+    config.max_open_sockets = 2;
+
+    httpd_uri_t index_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = index_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t stream_uri = {
+        .uri = "/stream",
+        .method = HTTP_GET,
+        .handler = stream_handler,
+        .user_ctx = NULL
+    };
+
+    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
+        httpd_register_uri_handler(stream_httpd, &index_uri);
+        httpd_register_uri_handler(stream_httpd, &stream_uri);
+        ESP_LOGI(TAG, "HTTP server started on port 80");
+    } else {
+        ESP_LOGE(TAG, "Failed to start HTTP server");
+    }
+}
 
 static esp_err_t init_camera()
 {
@@ -56,12 +176,12 @@ static esp_err_t init_camera()
         ESP_LOGE(TAG, "Camera Init Failed: %s", esp_err_to_name(err));
         return err;
     }
-    
-    ESP_LOGI(TAG, "Camera initialized in RGB565 format");
+
+    ESP_LOGI(TAG, "Free heap: %u bytes", (unsigned int)esp_get_free_heap_size());
+    ESP_LOGI(TAG, "Largest free block: %u bytes", (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
     return ESP_OK;
 }
 
-/* example: RGB565 -> LCD */
 static esp_err_t example_lcd_rgb_draw(esp_lcd_panel_handle_t panel_handle, uint8_t *image)
 {
     uint32_t lines_num = 40;
@@ -73,58 +193,39 @@ static esp_err_t example_lcd_rgb_draw(esp_lcd_panel_handle_t panel_handle, uint8
 
 void my_lcd_camera_task(void *pvParameters)
 {
-    // 创建图像队列 (用于UDP传输)
-    image_queue = xQueueCreate(3, sizeof(camera_fb_t *));
-    if (!image_queue) {
-        ESP_LOGE(TAG, "Failed to create image queue");
-        vTaskDelete(NULL);
-        return;
-    }
-    
-    // 启动UDP传输任务
-    xTaskCreate(udp_transmit_task, "udp_transmit", 4096, (void *)image_queue, 5, NULL);
-    ESP_LOGI(TAG, "UDP transmit task started");
-
-    // 初始化外设
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
-    
-    // 初始化摄像头
+
     if (ESP_OK != init_camera()) {
         vTaskDelete(NULL);
         return;
     }
 
-    // 初始化LCD
     esp_lcd_panel_handle_t panel_handle = audio_board_lcd_init(set, NULL);
     if (!panel_handle) {
         ESP_LOGE(TAG, "LCD initialization failed");
         vTaskDelete(NULL);
         return;
     }
-    
+
+    start_webserver();
+
     while (1) {
-        ESP_LOGI(TAG, "Taking picture...");
-        // 获取摄像头帧
         camera_fb_t *pic = esp_camera_fb_get();
         if (!pic) {
-            vTaskDelay(1); // 短暂让出CPU
+            vTaskDelay(1);
             continue;
         }
-        
-        // use pic->buf to access the image
-        ESP_LOGI(TAG, "Picture taken! The size was: %zu bytes, w:%d, h:%d", pic->len, pic->width, pic->height);
-        example_lcd_rgb_draw(panel_handle, pic->buf);
 
-        // 将图像发送到UDP传输队列
-        if (xQueueSend(image_queue, &pic, 0) != pdTRUE) {
-            ESP_LOGW(TAG, "UDP queue full, discarding frame");
-            esp_camera_fb_return(pic);
+        example_lcd_rgb_draw(panel_handle, pic->buf);
+        esp_camera_fb_return(pic);
+
+        static int counter = 0;
+        if (++counter % 10 == 0) {
+            AUDIO_MEM_SHOW(TAG);
         }
 
-        AUDIO_MEM_SHOW(TAG);
-        esp_camera_fb_return(pic);
-        vTaskDelay(2);
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -133,10 +234,10 @@ void my_lcd_camera_init(void)
     xTaskCreatePinnedToCore(
         my_lcd_camera_task,
         "cam_task",
-        4096,
+        8192,    // ⬅️ 提高任务栈
         NULL,
         4,
         NULL,
-        1  // 在APP核心运行
+        1
     );
 }

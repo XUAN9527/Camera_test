@@ -6,6 +6,5 @@ idf_component_register(
         "main.c"    
         "lcd_camera.c"
         "softap_sta.c"
-        "udp_transmitter"
     INCLUDE_DIRS
         ".")

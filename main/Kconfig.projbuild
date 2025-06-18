@@ -39,7 +39,7 @@ menu "Example Lcd Camera"
         config UDP_STREAM_PORT
             int "UDP Streaming Port"
             range 1025 65535
-            default 3334
+            default 3333
             help
                 Port for camera video streaming
         

@@ -27,3 +27,21 @@ void app_main(void)
     // 3. 初始化摄像头和LCD显示
     my_lcd_camera_init();
 }
+
+// 创建图像队列 (用于UDP传输) - my_lcd_camera_task() while前
+// image_queue = xQueueCreate(3, sizeof(camera_fb_t *));
+// if (!image_queue) {
+//     ESP_LOGE(TAG, "Failed to create image queue");
+//     vTaskDelete(NULL);
+//     return;
+// }
+
+// 启动UDP传输任务
+// xTaskCreate(udp_transmit_task, "udp_transmit", 4096, (void *)image_queue, 5, NULL);
+// ESP_LOGI(TAG, "UDP transmit task started");
+
+// 将图像发送到UDP传输队列 - my_lcd_camera_task() esp_camera_fb_return(pic); 后
+// if (xQueueSend(image_queue, &pic, 0) != pdTRUE) {
+//     ESP_LOGW(TAG, "UDP queue full, discarding frame");
+//     esp_camera_fb_return(pic);
+// }
