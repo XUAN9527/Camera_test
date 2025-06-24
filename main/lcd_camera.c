@@ -39,16 +39,74 @@ static camera_config_t camera_config = {
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
 
-    .xclk_freq_hz = 40000000,
+    .xclk_freq_hz = 20000000,       // DEFAULT: 40000000, 降低时钟频率至20MHz
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_RGB565,
     .frame_size = FRAMESIZE_QVGA,
     .jpeg_quality = 12,
-    .fb_count = 2,
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+    .fb_count = 3,
+    .grab_mode = CAMERA_GRAB_LATEST, // DEFAULT: CAMERA_GRAB_WHEN_EMPTY
+    .fb_location = CAMERA_FB_IN_PSRAM  // 强制使用PSRAM
 };
 
+
+// WIFI AP CODE START
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "lwip/ip4_addr.h"
+void wifi_init_softap() {
+    // 1. 初始化NVS
+    ESP_ERROR_CHECK(nvs_flash_init());
+    
+    // 2. 初始化TCP/IP网络栈
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    // 3. 创建默认AP网络接口
+    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
+    
+    // 4. 配置AP的IP地址（关键修改）
+    esp_netif_ip_info_t ip_info;
+    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);      // AP自身IP
+    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);      // 网关（同AP IP）
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0); // 子网掩码
+    
+    // 停止DHCP服务器 → 设置静态IP → 重启DHCP
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
+
+    // 5. WiFi配置（保持原有SSID/密码等设置）
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    
+    wifi_config_t wifi_config = {
+        .ap = {
+            .ssid = "ESP32_CAMERA",
+            .password = "12345678",
+            .ssid_len = strlen("ESP32_CAMERA"),
+            .channel = 6,
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK
+        }
+    };
+    
+    // 6. 启动WiFi AP
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // 打印IP信息（验证配置）
+    ESP_LOGI(TAG, "WiFi AP Started");
+    ESP_LOGI(TAG, "SSID: %s", wifi_config.ap.ssid);
+    ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ip_info.ip));
+}
+
+
+// HTTP SERVER CODE START
 // HTTP服务器句柄
 static httpd_handle_t stream_httpd = NULL;
 
@@ -169,7 +227,8 @@ static void start_webserver(void)
     }
 }
 
-static esp_err_t init_camera()
+// CAMERA CODE START
+static esp_err_t init_camera(void)
 {
     esp_err_t err = esp_camera_init(&camera_config);
     if (err != ESP_OK) {
@@ -221,7 +280,7 @@ void my_lcd_camera_task(void *pvParameters)
         esp_camera_fb_return(pic);
 
         static int counter = 0;
-        if (++counter % 10 == 0) {
+        if (++counter % 20 == 0) {
             AUDIO_MEM_SHOW(TAG);
         }
 
@@ -231,6 +290,7 @@ void my_lcd_camera_task(void *pvParameters)
 
 void my_lcd_camera_init(void)
 {
+    wifi_init_softap();
     xTaskCreatePinnedToCore(
         my_lcd_camera_task,
         "cam_task",
