@@ -7,4 +7,5 @@ idf_component_register(
         "lcd_camera.c"
         "softap_sta.c"
     INCLUDE_DIRS
-        ".")
+        "."
+    )

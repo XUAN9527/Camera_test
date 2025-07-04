@@ -1,32 +1,38 @@
-/* LCD Camera with AP UDP Streaming - RGB565 Only */
+// lcd_camera_rtsp.c
+
 #include <stdio.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
+#include "esp_camera.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "nvs_flash.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
+#include "lwip/inet.h"
+#include "esp_lcd_panel_ops.h"
 #include "board.h"
 #include "audio_mem.h"
-#include "esp_camera.h"
-#include "esp_lcd_panel_ops.h"
-#include "freertos/queue.h"
-#include "esp_jpeg_common.h"
-#include "esp_http_server.h"
 #include "esp_heap_caps.h"
-#include <inttypes.h>
 
-static const char *TAG = "LCD_Camera";
+#define TAG "LCD_CAM_RTSP"
+#define FRAME_QUEUE_LEN 2
+#define LCD_H_RES 320
+#define LCD_V_RES 240
+#define MAX_UDP_PAYLOAD 1400
+#define RTSP_PORT 554
 
-// 显示分辨率
-#define EXAMPLE_LCD_H_RES   320
-#define EXAMPLE_LCD_V_RES   240
-#define EXAMPLE_FRAME_SIZE  8   // 降低帧率
-
-// 摄像头配置
+// 需要根据你的板子定义正确摄像头引脚
 static camera_config_t camera_config = {
     .pin_pwdn = CAM_PIN_PWDN,
     .pin_reset = CAM_PIN_RESET,
     .pin_xclk = CAM_PIN_XCLK,
     .pin_sscb_sda = CAM_PIN_SIOD,
     .pin_sscb_scl = CAM_PIN_SIOC,
-
     .pin_d7 = CAM_PIN_D7,
     .pin_d6 = CAM_PIN_D6,
     .pin_d5 = CAM_PIN_D5,
@@ -38,266 +44,293 @@ static camera_config_t camera_config = {
     .pin_vsync = CAM_PIN_VSYNC,
     .pin_href = CAM_PIN_HREF,
     .pin_pclk = CAM_PIN_PCLK,
-
-    .xclk_freq_hz = 20000000,       // DEFAULT: 40000000, 降低时钟频率至20MHz
+    .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_RGB565,
     .frame_size = FRAMESIZE_QVGA,
     .jpeg_quality = 12,
-    .fb_count = 3,
-    .grab_mode = CAMERA_GRAB_LATEST, // DEFAULT: CAMERA_GRAB_WHEN_EMPTY
-    .fb_location = CAMERA_FB_IN_PSRAM  // 强制使用PSRAM
+    .fb_count = 2,
+    .grab_mode = CAMERA_GRAB_LATEST,
+    .fb_location = CAMERA_FB_IN_PSRAM,
 };
 
+static QueueHandle_t frame_queue;
+static esp_lcd_panel_handle_t panel_handle;
+static esp_ip4_addr_t latest_client_ip;
+static uint16_t client_rtp_port = 0;
+static bool rtsp_streaming = false;
+static int rtsp_client_socket = -1;
 
-// WIFI AP CODE START
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "nvs_flash.h"
-#include "esp_netif.h"
-#include "lwip/ip4_addr.h"
-void wifi_init_softap() {
-    // 1. 初始化NVS
+// --- WiFi SoftAP 初始化 ---
+static void wifi_event_handler(void *arg, esp_event_base_t event_base,
+                               int32_t event_id, void *event_data) {
+    if (event_base == IP_EVENT && event_id == IP_EVENT_AP_STAIPASSIGNED) {
+        ip_event_ap_staipassigned_t *event = (ip_event_ap_staipassigned_t *)event_data;
+        latest_client_ip = event->ip;
+        ESP_LOGI(TAG, "Client IP assigned: %s", ip4addr_ntoa((const ip4_addr_t*)&latest_client_ip));
+    }
+}
+
+static void wifi_init_softap() {
     ESP_ERROR_CHECK(nvs_flash_init());
-    
-    // 2. 初始化TCP/IP网络栈
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    
-    // 3. 创建默认AP网络接口
-    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
-    
-    // 4. 配置AP的IP地址（关键修改）
-    esp_netif_ip_info_t ip_info;
-    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);      // AP自身IP
-    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);      // 网关（同AP IP）
-    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0); // 子网掩码
-    
-    // 停止DHCP服务器 → 设置静态IP → 重启DHCP
-    ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));
-    ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));
-    ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));
+    esp_netif_create_default_wifi_ap();
 
-    // 5. WiFi配置（保持原有SSID/密码等设置）
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-    
+
     wifi_config_t wifi_config = {
         .ap = {
-            .ssid = "ESP32_CAMERA",
+            .ssid = "ESP32_CAM",
             .password = "12345678",
-            .ssid_len = strlen("ESP32_CAMERA"),
-            .channel = 6,
+            .ssid_len = strlen("ESP32_CAM"),
+            .channel = 1,
             .max_connection = 4,
             .authmode = WIFI_AUTH_WPA2_PSK
         }
     };
-    
-    // 6. 启动WiFi AP
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED, &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-
-    // 打印IP信息（验证配置）
-    ESP_LOGI(TAG, "WiFi AP Started");
-    ESP_LOGI(TAG, "SSID: %s", wifi_config.ap.ssid);
-    ESP_LOGI(TAG, "IP: " IPSTR, IP2STR(&ip_info.ip));
+    ESP_LOGI(TAG, "WiFi AP started. SSID: %s", wifi_config.ap.ssid);
 }
 
-
-// HTTP SERVER CODE START
-// HTTP服务器句柄
-static httpd_handle_t stream_httpd = NULL;
-
-// MJPEG流处理函数
-static esp_err_t stream_handler(httpd_req_t *req)
+// --- RTSP 简易服务器代码 ---
+static int parse_client_rtp_port(const char *setup_request)
 {
-    camera_fb_t *fb = NULL;
-    esp_err_t res = ESP_OK;
-    char part_buf[128];
-
-    res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
-    if (res != ESP_OK) {
-        return res;
-    }
-
-    while (true) {
-        fb = esp_camera_fb_get();
-        if (!fb) {
-            ESP_LOGE(TAG, "Camera capture failed");
-            res = ESP_FAIL;
-            break;
-        }
-
-        uint8_t *jpeg_buf_ptr = NULL;
-        size_t jpeg_size = 0;
-
-        if (!frame2jpg(fb, 60, &jpeg_buf_ptr, &jpeg_size)) {
-            ESP_LOGE(TAG, "JPEG compression failed");
-            esp_camera_fb_return(fb);
-            continue;
-        }
-
-        int header_len = snprintf(part_buf, sizeof(part_buf),
-                                  "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                                  (unsigned int)jpeg_size);
-
-        if (header_len < 0 || header_len >= sizeof(part_buf)) {
-            ESP_LOGE(TAG, "Header formatting failed");
-            esp_camera_fb_return(fb);
-            free(jpeg_buf_ptr);
-            continue;
-        }
-
-        res = httpd_resp_send_chunk(req, part_buf, header_len);
-        if (res != ESP_OK) {
-            ESP_LOGW(TAG, "Send header failed: %s", esp_err_to_name(res));
-            esp_camera_fb_return(fb);
-            free(jpeg_buf_ptr);
-            break;
-        }
-
-        res = httpd_resp_send_chunk(req, (const char *)jpeg_buf_ptr, jpeg_size);
-        if (res != ESP_OK) {
-            ESP_LOGW(TAG, "Send image failed: %s", esp_err_to_name(res));
-            esp_camera_fb_return(fb);
-            free(jpeg_buf_ptr);
-            break;
-        }
-
-        res = httpd_resp_send_chunk(req, "\r\n", 2);
-        if (res != ESP_OK) {
-            ESP_LOGW(TAG, "Send frame end failed: %s", esp_err_to_name(res));
-            esp_camera_fb_return(fb);
-            free(jpeg_buf_ptr);
-            break;
-        }
-
-        esp_camera_fb_return(fb);
-        free(jpeg_buf_ptr);
-
-        vTaskDelay(pdMS_TO_TICKS(1000 / EXAMPLE_FRAME_SIZE));
-    }
-
-    if (fb) {
-        esp_camera_fb_return(fb);
-    }
-
-    return res;
+    const char *p = strstr(setup_request, "client_port=");
+    if (!p) return 0;
+    int rtp_port = 0;
+    sscanf(p, "client_port=%d", &rtp_port);
+    return rtp_port;
 }
 
-// 首页 HTML
-static esp_err_t index_handler(httpd_req_t *req)
+static void send_rtsp_response(int sock, const char *response)
 {
-    const char *html = "<html><head><title>ESP32 Camera</title></head>"
-                       "<body><h1>ESP32 Camera</h1><img src=\"/stream\"></body></html>";
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, html, strlen(html));
+    send(sock, response, strlen(response), 0);
 }
 
-// 启动 HTTPD
-static void start_webserver(void)
+static void rtsp_server_task(void *arg)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 80;
-    config.ctrl_port = 32760;
-    config.max_open_sockets = 2;
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    char buf[1024];
+    int len;
 
-    httpd_uri_t index_uri = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = index_handler,
-        .user_ctx = NULL
-    };
-
-    httpd_uri_t stream_uri = {
-        .uri = "/stream",
-        .method = HTTP_GET,
-        .handler = stream_handler,
-        .user_ctx = NULL
-    };
-
-    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
-        httpd_register_uri_handler(stream_httpd, &index_uri);
-        httpd_register_uri_handler(stream_httpd, &stream_uri);
-        ESP_LOGI(TAG, "HTTP server started on port 80");
-    } else {
-        ESP_LOGE(TAG, "Failed to start HTTP server");
-    }
-}
-
-// CAMERA CODE START
-static esp_err_t init_camera(void)
-{
-    esp_err_t err = esp_camera_init(&camera_config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera Init Failed: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    ESP_LOGI(TAG, "Free heap: %u bytes", (unsigned int)esp_get_free_heap_size());
-    ESP_LOGI(TAG, "Largest free block: %u bytes", (unsigned int)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-    return ESP_OK;
-}
-
-static esp_err_t example_lcd_rgb_draw(esp_lcd_panel_handle_t panel_handle, uint8_t *image)
-{
-    uint32_t lines_num = 40;
-    for (int i = 0; i < EXAMPLE_LCD_V_RES / lines_num; ++i) {
-        esp_lcd_panel_draw_bitmap(panel_handle, 0, i * lines_num, EXAMPLE_LCD_H_RES, lines_num + i * lines_num, image + EXAMPLE_LCD_H_RES * i * lines_num * 2);
-    }
-    return ESP_OK;
-}
-
-void my_lcd_camera_task(void *pvParameters)
-{
-    esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
-    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
-
-    if (ESP_OK != init_camera()) {
+    int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_sock < 0) {
+        ESP_LOGE(TAG, "Failed to create RTSP socket");
         vTaskDelete(NULL);
         return;
     }
 
-    esp_lcd_panel_handle_t panel_handle = audio_board_lcd_init(set, NULL);
-    if (!panel_handle) {
-        ESP_LOGE(TAG, "LCD initialization failed");
+    int opt = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(RTSP_PORT);
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(listen_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        ESP_LOGE(TAG, "Bind failed");
+        close(listen_sock);
         vTaskDelete(NULL);
         return;
     }
 
-    start_webserver();
+    if (listen(listen_sock, 1) < 0) {
+        ESP_LOGE(TAG, "Listen failed");
+        close(listen_sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "RTSP server listening on port %d", RTSP_PORT);
 
     while (1) {
-        camera_fb_t *pic = esp_camera_fb_get();
-        if (!pic) {
-            vTaskDelay(1);
+        rtsp_client_socket = accept(listen_sock, (struct sockaddr *)&client_addr, &client_addr_len);
+        if (rtsp_client_socket < 0) {
+            ESP_LOGE(TAG, "Accept failed");
             continue;
         }
 
-        example_lcd_rgb_draw(panel_handle, pic->buf);
-        esp_camera_fb_return(pic);
+        ESP_LOGI(TAG, "RTSP client connected");
 
-        static int counter = 0;
-        if (++counter % 20 == 0) {
-            AUDIO_MEM_SHOW(TAG);
+        rtsp_streaming = false;
+        client_rtp_port = 0;
+
+        while ((len = recv(rtsp_client_socket, buf, sizeof(buf) - 1, 0)) > 0) {
+            buf[len] = 0;
+            ESP_LOGI(TAG, "RTSP request:\n%s", buf);
+
+            if (strstr(buf, "OPTIONS")) {
+                const char *resp = 
+                    "RTSP/1.0 200 OK\r\n"
+                    "CSeq: 1\r\n"
+                    "Public: OPTIONS, DESCRIBE, SETUP, TEARDOWN, PLAY, PAUSE\r\n\r\n";
+                send_rtsp_response(rtsp_client_socket, resp);
+            }
+            else if (strstr(buf, "DESCRIBE")) {
+                const char *sdp = 
+                    "v=0\r\n"
+                    "o=- 0 0 IN IP4 0.0.0.0\r\n"
+                    "s=ESP32-CAM MJPEG Stream\r\n"
+                    "m=video 0 RTP/AVP 26\r\n"
+                    "a=control:streamid=0\r\n"
+                    "a=mimetype:string;\"video/MJPEG\"\r\n";
+
+                char resp[512];
+                snprintf(resp, sizeof(resp),
+                         "RTSP/1.0 200 OK\r\n"
+                         "CSeq: 2\r\n"
+                         "Content-Type: application/sdp\r\n"
+                         "Content-Length: %d\r\n\r\n%s",
+                         (int)strlen(sdp), sdp);
+                send_rtsp_response(rtsp_client_socket, resp);
+            }
+            else if (strstr(buf, "SETUP")) {
+                int port = parse_client_rtp_port(buf);
+                if (port > 0) {
+                    client_rtp_port = port;
+                    ESP_LOGI(TAG, "Client RTP port: %d", client_rtp_port);
+
+                    char resp[256];
+                    snprintf(resp, sizeof(resp),
+                             "RTSP/1.0 200 OK\r\n"
+                             "CSeq: 3\r\n"
+                             "Transport: RTP/AVP;unicast;client_port=%d-%d;server_port=8000-8001\r\n"
+                             "Session: 12345678\r\n\r\n",
+                             client_rtp_port, client_rtp_port + 1);
+                    send_rtsp_response(rtsp_client_socket, resp);
+                }
+                else {
+                    ESP_LOGE(TAG, "Failed to parse client RTP port");
+                }
+            }
+            else if (strstr(buf, "PLAY")) {
+                const char *resp =
+                    "RTSP/1.0 200 OK\r\n"
+                    "CSeq: 4\r\n"
+                    "Session: 12345678\r\n\r\n";
+                send_rtsp_response(rtsp_client_socket, resp);
+                rtsp_streaming = true;
+                ESP_LOGI(TAG, "RTSP PLAY received, start streaming");
+            }
+            else if (strstr(buf, "TEARDOWN")) {
+                const char *resp =
+                    "RTSP/1.0 200 OK\r\n"
+                    "CSeq: 5\r\n"
+                    "Session: 12345678\r\n\r\n";
+                send_rtsp_response(rtsp_client_socket, resp);
+                rtsp_streaming = false;
+                break;
+            }
+            else {
+                const char *resp = "RTSP/1.0 200 OK\r\n\r\n";
+                send_rtsp_response(rtsp_client_socket, resp);
+            }
         }
 
-        vTaskDelay(pdMS_TO_TICKS(50));
+        ESP_LOGI(TAG, "RTSP client disconnected");
+        close(rtsp_client_socket);
+        rtsp_client_socket = -1;
+        client_rtp_port = 0;
+        rtsp_streaming = false;
     }
 }
 
-void my_lcd_camera_init(void)
-{
+// --- RTP 发送 ---
+static void send_mjpeg_rtp(uint8_t *jpeg, size_t len) {
+    if (latest_client_ip.addr == 0 || client_rtp_port == 0 || !rtsp_streaming) return;
+
+    struct sockaddr_in client_rtp_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(client_rtp_port),
+        .sin_addr.s_addr = latest_client_ip.addr
+    };
+
+    static uint16_t seq = 0;
+    static uint32_t ssrc = 0x12345678;
+    uint32_t ts = xTaskGetTickCount() * 90;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return;
+
+    for (size_t offset = 0; offset < len;) {
+        size_t chunk = (len - offset) > (MAX_UDP_PAYLOAD - 12) ? (MAX_UDP_PAYLOAD - 12) : (len - offset);
+        uint8_t pkt[MAX_UDP_PAYLOAD];
+        pkt[0] = 0x80;
+        pkt[1] = (offset + chunk >= len ? 0x80 : 0) | 26;  // 26 = MJPEG
+        pkt[2] = (seq >> 8) & 0xFF; pkt[3] = seq & 0xFF;
+        pkt[4] = (ts >> 24) & 0xFF; pkt[5] = (ts >> 16) & 0xFF; pkt[6] = (ts >> 8) & 0xFF; pkt[7] = ts & 0xFF;
+        pkt[8] = (ssrc >> 24) & 0xFF; pkt[9] = (ssrc >> 16) & 0xFF; pkt[10] = (ssrc >> 8) & 0xFF; pkt[11] = ssrc & 0xFF;
+        memcpy(pkt + 12, jpeg + offset, chunk);
+
+        sendto(sock, pkt, chunk + 12, 0, (struct sockaddr *)&client_rtp_addr, sizeof(client_rtp_addr));
+        offset += chunk;
+        seq++;
+    }
+
+    close(sock);
+}
+
+// --- LCD 显示 ---
+esp_err_t example_lcd_rgb_draw(esp_lcd_panel_handle_t handle, uint8_t *image) {
+    int lines = 40;
+    for (int i = 0; i < LCD_V_RES / lines; i++) {
+        esp_lcd_panel_draw_bitmap(handle, 0, i * lines, LCD_H_RES, (i + 1) * lines, image + i * lines * LCD_H_RES * 2);
+    }
+    return ESP_OK;
+}
+
+// --- 采集+显示+发送任务 ---
+static void display_and_send_task(void *arg) {
+    while (1) {
+        camera_fb_t *fb = NULL;
+        if (xQueueReceive(frame_queue, &fb, portMAX_DELAY) == pdTRUE && fb) {
+            example_lcd_rgb_draw(panel_handle, fb->buf);
+
+            uint8_t *jpeg_buf = NULL;
+            size_t jpeg_len = 0;
+            if (frame2jpg(fb, 60, &jpeg_buf, &jpeg_len)) {
+                send_mjpeg_rtp(jpeg_buf, jpeg_len);
+                free(jpeg_buf);
+            }
+
+            esp_camera_fb_return(fb);
+        }
+    }
+}
+
+// --- 采集任务 ---
+static void capture_task(void *arg) {
+    while (1) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            if (xQueueSend(frame_queue, &fb, 10) != pdTRUE) {
+                esp_camera_fb_return(fb);
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+// --- 初始化入口 ---
+void my_lcd_camera_init(void) {
     wifi_init_softap();
-    xTaskCreatePinnedToCore(
-        my_lcd_camera_task,
-        "cam_task",
-        8192,    // ⬅️ 提高任务栈
-        NULL,
-        4,
-        NULL,
-        1
-    );
+
+    ESP_ERROR_CHECK(esp_camera_init(&camera_config));
+
+    frame_queue = xQueueCreate(FRAME_QUEUE_LEN, sizeof(camera_fb_t *));
+    esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
+    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
+    panel_handle = audio_board_lcd_init(set, NULL);
+
+    xTaskCreatePinnedToCore(display_and_send_task, "display_send", 8192, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(capture_task, "capture", 4096, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(rtsp_server_task, "rtsp_server", 8192, NULL, 5, NULL, 1);
 }
