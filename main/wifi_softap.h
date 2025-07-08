@@ -5,6 +5,8 @@
    software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
    CONDITIONS OF ANY KIND, either express or implied.
 */
+#ifndef __WIFI_SOFTAP_H
+#define __WIFI_SOFTAP_H
 
 #pragma once
 
@@ -14,9 +16,11 @@
 extern "C" {
 #endif  /* __cplusplus */
 
-void wifi_ap_udp_init(void);
+void wifi_init_softap(void);
 
 
 #ifdef __cplusplus
 }
 #endif  /* __cplusplus */
+
+#endif

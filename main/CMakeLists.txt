@@ -5,7 +5,9 @@ idf_component_register(
     SRCS
         "main.c"    
         "lcd_camera.c"
-        "softap_sta.c"
+        "wifi_softap.c"
+		"rtsp_server.c"
+		"http_server.c"
     INCLUDE_DIRS
         "."
     )

@@ -3,6 +3,6 @@
 # project subdirectory.
 #
 
-PROJECT_NAME := lcd_camera
+PROJECT_NAME := camera_test
 
 include $(ADF_PATH)/project.mk

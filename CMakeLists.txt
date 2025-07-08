@@ -9,4 +9,4 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 file(GLOB_RECURSE SOURCES "main/*.c")
 # set(EXTRA_COMPONENT_DIRS "components")
 
-project(camera_demo)
+project(camera_test)
