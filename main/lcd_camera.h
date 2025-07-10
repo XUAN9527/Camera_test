@@ -11,6 +11,7 @@
 #pragma once
 
 #include <stdio.h>
+#include <stdbool.h>
 #include "esp_err.h"
 #include "esp_lcd_types.h"
 
@@ -19,6 +20,7 @@ extern "C" {
 #endif  /* __cplusplus */
 
 typedef struct {
+	bool (*stream_flag)(void);					   // 转换标志
     void (*send_jpeg)(uint8_t *jpeg, size_t len);  // 注册 MJPEG 回调
 } lcd_camera_config_t;
 

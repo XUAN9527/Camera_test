@@ -13,12 +13,17 @@
 #define RTSP_PORT 554
 #define RTP_PAYLOAD_TYPE_MJPEG 26
 #define MAX_RTP_PAYLOAD 1500
-#define FRAME_RATE 15
+#define FRAME_RATE 10
 
 static uint32_t latest_client_ip = 0;
 static bool rtsp_streaming = false;
 static int rtsp_client_socket = -1;
 static bool use_tcp_transport = true; // 默认 TCP（VLC 兼容性更高）
+
+bool rtsp_stream_flag_get(void)
+{
+	return rtsp_streaming;
+}
 
 static void send_rtsp_response(int sock, int cseq, const char *response) {
     ESP_LOGD(TAG, "Sending RTSP response:\n%s", response);
@@ -191,37 +196,34 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len) {
 
     uint32_t ts = now * 90; // 90kHz 时钟（RFC规定）
 
-    // 验证 JPEG 起始标志
     if (len < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8) {
         ESP_LOGE(TAG, "Invalid JPEG frame");
         return;
     }
 
-    ESP_LOGD(TAG, "Sending JPEG frame: %d bytes, seq: %d", len, seq);
+    // 默认参数
+    uint8_t type = 1;     // JPEG Type 1: baseline DCT
+    uint8_t q = 255;      // Quantization table omitted (default)
+    uint8_t width8 = 320 / 8;   // 40
+    uint8_t height8 = 240 / 8;  // 30
 
     size_t offset = 0;
-
-    // ⚠️ 修复关键参数（确保兼容 VLC）
-    uint8_t type = 0;  // baseline JPEG type (标准类型)
-    uint8_t q = 255;   // 默认量化表（不传表）
-    uint8_t width8 = 320 / 8;  // 以 8 为单位，VLC 必须和实际 JPEG 匹配
-    uint8_t height8 = 240 / 8;
-
     while (offset < len) {
-        size_t chunk = (len - offset > MAX_RTP_PAYLOAD - 20) ? MAX_RTP_PAYLOAD - 20 : len - offset;
+        size_t chunk = (len - offset > MAX_RTP_PAYLOAD - 8) ? (MAX_RTP_PAYLOAD - 8) : (len - offset);
 
-        uint8_t pkt[4 + 12 + 8 + chunk]; // interleaved + RTP + JPEG header + data
+        uint8_t pkt[4 + 12 + 8 + chunk];  // interleaved + RTP + JPEG header + data
         int i = 0;
 
-        // Interleaved header (TCP over RTSP)
+        // RTSP Interleaved Header
         pkt[i++] = '$';
-        pkt[i++] = 0x00; // channel 0 for RTP
-        pkt[i++] = ((12 + 8 + chunk) >> 8) & 0xFF;
-        pkt[i++] = (12 + 8 + chunk) & 0xFF;
+        pkt[i++] = 0x00; // Channel 0 for RTP
+        uint16_t pkt_len = 12 + 8 + chunk;
+        pkt[i++] = (pkt_len >> 8) & 0xFF;
+        pkt[i++] = pkt_len & 0xFF;
 
-        // RTP header (12 bytes)
-        pkt[i++] = 0x80; // Version: 2
-        pkt[i++] = ((offset + chunk) >= len ? 0x80 : 0x00) | RTP_PAYLOAD_TYPE_MJPEG; // Marker bit + payload type
+        // RTP Header (12 bytes)
+        pkt[i++] = 0x80; // Version:2, P=0, X=0, CC=0
+        pkt[i++] = ((offset + chunk) >= len ? 0x80 : 0x00) | RTP_PAYLOAD_TYPE_MJPEG;
         pkt[i++] = (seq >> 8) & 0xFF;
         pkt[i++] = seq & 0xFF;
         pkt[i++] = (ts >> 24) & 0xFF;
@@ -233,20 +235,18 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len) {
         pkt[i++] = (ssrc >> 8) & 0xFF;
         pkt[i++] = ssrc & 0xFF;
 
-        // JPEG RTP header (RFC 2435 - 8 bytes)
-        pkt[i++] = 0x00; // Type-specific = 0
+        // JPEG RTP Header (8 bytes, RFC2435)
+        pkt[i++] = 0x00;                          // Type-specific
+        pkt[i++] = (offset >> 16) & 0xFF;         // Fragment offset (3 bytes)
         pkt[i++] = (offset >> 8) & 0xFF;
         pkt[i++] = offset & 0xFF;
-        pkt[i++] = type;
-        pkt[i++] = q;
-        pkt[i++] = width8;
-        pkt[i++] = height8;
-        pkt[i++] = 0x00; // Restart interval / Reserved
+        pkt[i++] = type;                          // JPEG Type
+        pkt[i++] = q;                             // Q = 255 (quant omitted)
+        pkt[i++] = width8;                        // Width in 8-pixel blocks
+        pkt[i++] = height8;                       // Height in 8-pixel blocks
 
-        // JPEG 数据拷贝
         memcpy(pkt + i, jpeg + offset, chunk);
 
-        // 发送整个 RTP 包
         int sent = send(rtsp_client_socket, pkt, i + chunk, 0);
         if (sent < 0) {
             ESP_LOGE(TAG, "Send failed, errno=%d", errno);
@@ -254,10 +254,9 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len) {
             break;
         }
 
+        seq++;
         offset += chunk;
     }
-
-    seq++;
 }
 
 void rtsp_server_start(void) {

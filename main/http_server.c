@@ -12,9 +12,16 @@ static httpd_handle_t server = NULL;
 static uint8_t *latest_frame = NULL;
 static size_t latest_frame_len = 0;
 static SemaphoreHandle_t frame_mutex;
+static bool http_stream_flag = false;
+
+bool http_stream_flag_get(void)
+{
+	return http_stream_flag;
+}
 
 static esp_err_t mjpeg_handler(httpd_req_t *req) {
-    ESP_LOGI(TAG, "MJPEG stream connected");
+	http_stream_flag = true;
+    ESP_LOGI(TAG, "MJPEG stream connected, http_stream_flag = [%s]", http_stream_flag ? "true" : "false");
 
     // HTTP headers for MJPEG streaming
     httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
@@ -42,8 +49,8 @@ static esp_err_t mjpeg_handler(httpd_req_t *req) {
         }
         vTaskDelay(pdMS_TO_TICKS(50)); // 20 fps approx
     }
-
-    ESP_LOGI(TAG, "MJPEG stream disconnected");
+	http_stream_flag = false;
+    ESP_LOGI(TAG, "MJPEG stream disconnected, http_stream_flag = [%s]", http_stream_flag ? "true" : "false");
     return ESP_FAIL; // Client disconnected
 }
 
