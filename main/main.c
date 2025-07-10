@@ -5,35 +5,42 @@
 #include "wifi_softap.h"
 #include "rtsp_server.h"
 #include "http_server.h"
+#include "web_mjpeg_server.h"
 
 #define TAG "main"
 
-// #define HTTP_STREAM
+#define PUSH_STREAM_MODE	2
 
 // MJPEG 推送回调函数
 static void send_jpeg_callback(uint8_t *jpeg, size_t len) {
-#ifdef HTTP_STREAM
+#if PUSH_STREAM_MODE == 1
 	http_server_send_frame(jpeg, len);
-#else
+#elif PUSH_STREAM_MODE == 2
     rtsp_server_send_frame(jpeg, len);
+#elif PUSH_STREAM_MODE == 3
+	web_mjpeg_server_send_jpeg(jpeg, len);
 #endif
 }
 
 static bool stream_flag_callback(void) {
-#ifdef HTTP_STREAM
+#if PUSH_STREAM_MODE == 1
 	return http_stream_flag_get();
-#else
+#elif PUSH_STREAM_MODE == 2
     return rtsp_stream_flag_get();
+#elif PUSH_STREAM_MODE == 3	
+	return web_mjpeg_server_is_client_connected();
 #endif	
 }
 
 void app_main(void) {
     
     wifi_init_softap();		// 初始化 SoftAP
-#ifdef HTTP_STREAM
+#if PUSH_STREAM_MODE == 1
 	http_server_start();    // 启动HTTP服务器
-#else
+#elif PUSH_STREAM_MODE == 2
     rtsp_server_start();	// 初始化 RTSP Server
+#elif PUSH_STREAM_MODE == 3	
+	web_mjpeg_server_start();	// 初始化 WEB Server
 #endif
 
     // 启动摄像头+LCD，注册 MJPEG 推送函数

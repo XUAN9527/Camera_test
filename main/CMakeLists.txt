@@ -8,6 +8,7 @@ idf_component_register(
         "wifi_softap.c"
 		"rtsp_server.c"
 		"http_server.c"
+		"web_mjpeg_server.c"
     INCLUDE_DIRS
         "."
     )
