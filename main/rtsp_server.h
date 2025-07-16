@@ -10,7 +10,7 @@ extern "C" {
 #endif
 
 void rtsp_server_start(void);
-void rtsp_server_send_frame(uint8_t *jpeg, size_t len);
+void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type);
 void rtsp_server_on_ip_assigned(uint32_t client_ip);
 bool rtsp_stream_flag_get(void);
 

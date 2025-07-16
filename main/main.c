@@ -12,11 +12,11 @@
 #define PUSH_STREAM_MODE	2
 
 // MJPEG 推送回调函数
-static void send_jpeg_callback(uint8_t *jpeg, size_t len) {
+static void send_jpeg_callback(uint8_t *jpeg, size_t len, uint8_t type) {
 #if PUSH_STREAM_MODE == 1
 	http_server_send_frame(jpeg, len);
 #elif PUSH_STREAM_MODE == 2
-    rtsp_server_send_frame(jpeg, len);
+    rtsp_server_send_frame(jpeg, len, type);
 #elif PUSH_STREAM_MODE == 3
 	web_mjpeg_server_send_jpeg(jpeg, len);
 #endif

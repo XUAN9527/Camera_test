@@ -21,7 +21,7 @@ extern "C" {
 
 typedef struct {
 	bool (*stream_flag)(void);					   // 转换标志
-    void (*send_jpeg)(uint8_t *jpeg, size_t len);  // 注册 MJPEG 回调
+    void (*send_jpeg)(uint8_t *jpeg, size_t len, uint8_t type);  // 注册 MJPEG 回调
 } lcd_camera_config_t;
 
 esp_err_t lcd_camera_start(const lcd_camera_config_t *config);
