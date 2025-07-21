@@ -13,16 +13,21 @@
 
 #define TAG "RTSP_SERVER"
 
-// #define TCP_STREAM_ENABLE		 // TCP/UDP传输开关
+#define TCP_STREAM_ENABLE		 // TCP/UDP传输开关
+// #define JPEG_DQT_CHECK
 
 #define RTSP_PORT 554
 #define RTP_PAYLOAD_TYPE_MJPEG 26
-#define MAX_RTP_PAYLOAD 1400   // 保守点，避免IP包分片
-#define FRAME_RATE 15
+#define RTP_HEADER_SIZE     12
+#define JPEG_HEADER_SIZE    8
+#define MAX_PACKET_SIZE     1400
+#define RTP_MAX_PAYLOAD     (MAX_PACKET_SIZE - RTP_HEADER_SIZE - JPEG_HEADER_SIZE)
+
+#define FRAME_RATE 10
 #define FRAME_INTERVAL_US (1000000 / FRAME_RATE)
 
 // JPEG参数
-#define JPEG_QUALITY  0x5F      // 质量因子（0-255，建议0x3F-0x7F）
+#define JPEG_QUALITY  0x3F      // 质量因子（0-255，建议0x3F-0x7F）
 #define DISPLAY_H_RES (320 / 8)
 #define DISPLAY_V_RES (240 / 8)
 
@@ -32,11 +37,13 @@
 // 网络优化参数
 #define UDP_SEND_BUF_SIZE  (64 * 1024)  // UDP发送缓冲区
 
-#define RTP_RETRY_DELAY_MS    1       // 每次失败后延迟 1ms
-#define RTP_MAX_RETRY         3       // 每个包最多重试 3 次
+#define RTP_RETRY_DELAY_MS    6       // 每次失败后延迟 1ms
+#define RTP_RETRY_LIMIT       3       // 每个包最多重试 3 次
 #define RTP_FRAME_TIMEOUT_US  80000   // 单帧最长耗时 80ms，超过直接跳帧
 #define RTP_ENABLE_DROP_FRAME 1       // 启用超时丢帧策略
 
+// ✅ 在全局变量中新增客户端连接状态标志
+static bool rtsp_client_connected = false;
 static bool rtsp_streaming = false;
 static bool use_tcp_transport = false;
 static int rtsp_client_socket = -1;
@@ -53,7 +60,7 @@ static uint32_t error_count = 0;
 static uint64_t last_stat_time = 0;
 
 bool rtsp_stream_flag_get(void) {
-    return rtsp_streaming;
+    return rtsp_streaming && rtsp_client_connected;
 }
 
 static void send_rtsp_response(int sock, int cseq, const char *response) {
@@ -116,6 +123,7 @@ static void rtsp_server_task(void *arg) {
             ESP_LOGE(TAG, "Accept failed");
             continue;
         }
+		rtsp_client_connected = true;
 
         ESP_LOGI(TAG, "RTSP client connected from %s", inet_ntoa(client_addr.sin_addr));
         latest_client_ip = client_addr.sin_addr.s_addr;
@@ -238,6 +246,14 @@ static void rtsp_server_task(void *arg) {
                         break;
                     }
 
+					// ✅ 设置 UDP 发送超时（防止 sendto 永久阻塞）
+					struct timeval timeout = {.tv_sec = 0, .tv_usec = 50000};
+					setsockopt(udp_sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+					// ✅ 设置发送缓冲区大小
+					int send_buf_size = UDP_SEND_BUF_SIZE;
+					setsockopt(udp_sock, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
+
                     // 创建RTCP socket
                     udp_rtcp_sock = socket(AF_INET, SOCK_DGRAM, 0);
                     if (udp_rtcp_sock < 0) {
@@ -246,10 +262,6 @@ static void rtsp_server_task(void *arg) {
                         udp_sock = -1;
                         break;
                     }
-
-                    // 设置发送缓冲区大小
-                    int send_buf_size = UDP_SEND_BUF_SIZE;
-                    setsockopt(udp_sock, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
 					
                     struct sockaddr_in local_rtp_addr = {
                         .sin_family = AF_INET,
@@ -341,6 +353,9 @@ static void rtsp_server_task(void *arg) {
         }
 
         ESP_LOGI(TAG, "RTSP client disconnected");
+		rtsp_streaming = false;
+    	rtsp_client_connected = false;
+
         if (udp_sock >= 0) {
             close(udp_sock);
             udp_sock = -1;
@@ -351,7 +366,6 @@ static void rtsp_server_task(void *arg) {
         }
         close(rtsp_client_socket);
         rtsp_client_socket = -1;
-        rtsp_streaming = false;
     }
 }
 
@@ -386,6 +400,7 @@ static void send_rtcp_sr_report(uint32_t ntp_ts, uint32_t rtp_ts) {
     }
 }
 
+#ifdef JPEG_DQT_CHECK
 // 检测 JPEG 是否包含 DQT 段 (0xFFDB)
 static bool jpeg_has_dqt(const uint8_t *data, size_t len) {
     size_t i = 2; // 跳过 SOI 0xFFD8
@@ -421,6 +436,7 @@ static bool jpeg_has_dqt(const uint8_t *data, size_t len) {
 
     return false;
 }
+#endif
 
 void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
     if (!rtsp_streaming || (!use_tcp_transport && udp_sock < 0) || len < 2) {
@@ -439,20 +455,21 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
         ESP_LOGW(TAG, "Invalid JPEG header: %02X %02X", jpeg[0], jpeg[1]);
         return;
     }
-
+#ifdef JPEG_DQT_CHECK
 	// 检测是否包含 DQT，决定 RTP JPEG Type
-	// bool has_dqt = jpeg_has_dqt(jpeg, len);
-	// uint8_t type = has_dqt ? 0 : 1;
-	// ESP_LOGI(TAG, "JPEG header: %02X %02X, has_dqt=%s → type=%d", jpeg[0], jpeg[1], has_dqt ? "YES" : "NO", type);
-
+	bool has_dqt = jpeg_has_dqt(jpeg, len);
+	uint8_t type = has_dqt ? 0 : 1;
+	ESP_LOGI(TAG, "JPEG header: %02X %02X, has_dqt=%s → type=%d", jpeg[0], jpeg[1], has_dqt ? "YES" : "NO", type);
+#endif
     // 帧统计
     frame_count++;
     uint64_t now_ms = now_us / 1000;
     if (now_ms - last_stat_time >= 1000) {
         float loss_rate = error_count ? (error_count * 100.0f) / (packet_count + error_count) : 0;
-        ESP_LOGI(TAG, "Streaming: %u FPS, %u pkts, %u errs (%.1f%%)",
+        ESP_LOGI(TAG, "Streaming: %u FPS, %u pkts, %u bytes, %u errs (%.1f%%)",
                  (unsigned int)frame_count,
                  (unsigned int)packet_count,
+				 (unsigned int)len,
                  (unsigned int)error_count,
                  loss_rate);
         frame_count = 0;
@@ -473,8 +490,17 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
             return;
         }
 
-        size_t chunk = (len - offset > MAX_RTP_PAYLOAD - 8) ?
-                       (MAX_RTP_PAYLOAD - 8) : (len - offset);
+        size_t chunk = (len - offset > RTP_MAX_PAYLOAD) ? RTP_MAX_PAYLOAD : (len - offset);
+
+		// 调试日志（临时添加）
+		// ESP_LOGI(TAG, "Preparing pkt: offset=%d, chunk=%d, total=%d", 
+		// 		(int)offset, (int)chunk, (int)len);
+
+		// 验证分包合理性
+		if (chunk == 0 || chunk > RTP_MAX_PAYLOAD) {
+			ESP_LOGE(TAG, "Invalid chunk size: %d", (int)chunk);
+			break;
+		}
 
         bool is_first = (offset == 0);
         bool is_last = ((offset + chunk) >= len);
@@ -530,26 +556,47 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
             }
 
             if (sent < 0) {
-                if (errno == EAGAIN || errno == ENOMEM) {
-                    vTaskDelay(pdMS_TO_TICKS(delay));
-                    delay *= 2;
-                    retry++;
-                } else {
-                    fatal = true;
-                    rtsp_streaming = false;
-                    ESP_LOGE(TAG, "Fatal send error: errno=%d", errno);
-                    break;
-                }
-            }
-        } while (sent < 0 && !fatal && retry < RTP_MAX_RETRY);
+				int err = errno;
+
+				// 针对 UDP 特定错误进行分级处理
+				if (err == EAGAIN || err == ENOMEM || err == ENOBUFS) {
+					if (retry < RTP_RETRY_LIMIT) {  // 限制最大重试次数
+						ESP_LOGW(TAG, "Send retry #%d at offset %u: errno=%d (%s)",
+								retry, (unsigned int)offset, err, strerror(err));
+						vTaskDelay(pdMS_TO_TICKS(delay));
+						retry++;
+						delay = delay * 2 > 50 ? 50 : delay * 2;  // 延迟指数退避，最大不超 50ms
+					} else {
+						ESP_LOGE(TAG, "Retry limit reached (%d) at offset %u, drop packet",
+								retry, (unsigned int)offset);
+						break;  // 超过重试次数，丢弃该 RTP 包
+					}
+				} else {
+					fatal = true;
+					rtsp_streaming = false;
+					ESP_LOGE(TAG, "Fatal send error: errno=%d (%s)", err, strerror(err));
+					break;
+				}
+    		}
+		} while (sent < 0 && !fatal);
 
         if (sent < 0) {
             error_count++;
 #if RTP_ENABLE_DROP_FRAME
-            ESP_LOGW(TAG, "Drop frame due to send failure at offset %u", (unsigned int)offset);
+			// 11=EAGAIN:socket buffer 满; 12=ENOMEM,内存不足（通常是 LWIP 内部）;104=ECONNRESET,客户端断开连接；113=EHOSTUNREACH，客户端地址不可达
+           	ESP_LOGW(TAG, "Sendto failed at offset %u, errno=%d (%s)", (unsigned int)offset, errno, strerror(errno));
             frame_failed = true;
-            break;
 #endif
+			if (offset == 0) {
+				// 首包失败，整帧不可用
+				ESP_LOGW(TAG, "Drop frame due to send failure at offset 0 (critical)");
+				vTaskDelay(pdMS_TO_TICKS(100));  // 加一段等待，缓解发送拥堵
+				frame_failed = true;
+				break;
+			} else {
+				// 非首包失败，标记但继续传输（可选）
+				ESP_LOGW(TAG, "Non-first packet failed at offset %u, continuing", offset);
+			}
         } else {
             packet_count++;
         }
@@ -574,9 +621,10 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
 	// 根据帧处理时间动态延迟，避免帧率过快导致负载高
     uint64_t frame_used_us = esp_timer_get_time() - frame_start_us;
     uint64_t frame_interval_us = 1000000 / FRAME_RATE;
-    if (frame_used_us < frame_interval_us) {
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
+    int wait_ms = (int)((frame_interval_us > frame_used_us) ? (frame_interval_us - frame_used_us) / 1000 : 0);
+	if (wait_ms > 0 && wait_ms < 50) {
+		vTaskDelay(pdMS_TO_TICKS(wait_ms));
+	}
 }
 
 

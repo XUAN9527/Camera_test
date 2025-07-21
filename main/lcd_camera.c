@@ -15,7 +15,7 @@
 
 #define LCD_H_RES 320
 #define LCD_V_RES 240
-#define STREAM_FRAME_RATE 	15
+#define STREAM_FRAME_RATE 	10
 #define DISPLAY_FRAME_RATE 	10
 #define DISPLAY_SW_QUALITY	80 // 0~100
 
@@ -46,7 +46,7 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_JPEG, // PIXFORMAT_RGB565, PIXFORMAT_JPEG
     .frame_size = FRAMESIZE_QVGA,
-    .jpeg_quality = 15,
+    .jpeg_quality = 5,
     .fb_count = 2,
     .grab_mode = CAMERA_GRAB_LATEST,
     .fb_location = CAMERA_FB_IN_PSRAM,
@@ -159,43 +159,52 @@ static void debug_print_jpeg_base64(const uint8_t *data, size_t len)
 
 static void stream_task(void *arg) {
     while (1) {
-		if (user_config.send_jpeg && user_config.stream_flag())
+		camera_fb_t *fb = esp_camera_fb_get();
+		if (!fb) {
+            ESP_LOGE(TAG, "%s jpeg get failed!", use_hardware_jpeg ? "hardware" : "software");
+            vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
+            continue;
+        }
+		// ESP_LOGI(TAG, "send_jpeg ptr: %p, stream_flag ptr: %p", user_config.send_jpeg, user_config.stream_flag);
+		if (user_config.send_jpeg && user_config.stream_flag && user_config.stream_flag())
 		{
-			camera_fb_t *fb = esp_camera_fb_get();
-			if (fb) {
-				if (use_hardware_jpeg) {
-					if (fb->len > 100 && fb->buf[0] == JPEG_SOI0 && fb->buf[1] == JPEG_SOI1 &&
-						fb->buf[fb->len - 2] == JPEG_EOI0 && fb->buf[fb->len - 1] == JPEG_EOI1) 
-					{
-						uint8_t type = fb->format == PIXFORMAT_JPEG ? 0 : 1;
-						user_config.send_jpeg(fb->buf, fb->len, type);
-						// 添加这一行，仅打印前几帧检查
-						// static int printed = 0;
-						// if (printed++ < 3) {
-						// 	debug_print_jpeg_base64(fb->buf, fb->len);
-						// }
-					} else {
-						ESP_LOGW(TAG, "Invalid HW JPEG frame, skipping...");
-					}
+			if (use_hardware_jpeg) {
+				if (fb->len > 100 && fb->buf[0] == JPEG_SOI0 && fb->buf[1] == JPEG_SOI1 &&
+					fb->buf[fb->len - 2] == JPEG_EOI0 && fb->buf[fb->len - 1] == JPEG_EOI1) 
+				{
+					uint8_t type = fb->format == PIXFORMAT_JPEG ? 0 : 1;
+					user_config.send_jpeg(fb->buf, fb->len, type);
+					// 添加这一行，仅打印前几帧检查
+					// static int printed = 0;
+					// if (printed++ < 3) {
+					// 	debug_print_jpeg_base64(fb->buf, fb->len);
+					// }
 				} else {
-					uint8_t *jpeg_buf = NULL;
-					size_t jpeg_len = 0;
-					if (frame2jpg(fb, DISPLAY_SW_QUALITY, &jpeg_buf, &jpeg_len)) {
-						uint8_t type = fb->format == PIXFORMAT_JPEG ? 0 : 1;
-						user_config.send_jpeg(jpeg_buf, jpeg_len, type);
-						free(jpeg_buf);
-					} else {
-						ESP_LOGW(TAG, "SW JPEG encode failed");
-					}
+					ESP_LOGW(TAG, "Invalid HW JPEG frame, skipping...");
 				}
-				esp_camera_fb_return(fb);
+			} else {
+				uint8_t *jpeg_buf = NULL;
+				size_t jpeg_len = 0;
+				if (frame2jpg(fb, DISPLAY_SW_QUALITY, &jpeg_buf, &jpeg_len)) {
+					uint8_t type = fb->format == PIXFORMAT_JPEG ? 0 : 1;
+					user_config.send_jpeg(jpeg_buf, jpeg_len, type);
+					free(jpeg_buf);
+				} else {
+					ESP_LOGW(TAG, "SW JPEG encode failed");
+				}
 			}
 		}
+		esp_camera_fb_return(fb);
 		vTaskDelay(pdMS_TO_TICKS(1000/STREAM_FRAME_RATE));
 	}
 }
 
 esp_err_t lcd_camera_start(const lcd_camera_config_t *config) {
+	if (config == NULL || config->send_jpeg == NULL || config->stream_flag == NULL) {
+        ESP_LOGE(TAG, "Invalid lcd_camera_config! send_jpeg or stream_flag is NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+
     user_config = *config;
 	if (use_hardware_jpeg) {
 		camera_config.pixel_format = PIXFORMAT_JPEG;
@@ -203,7 +212,6 @@ esp_err_t lcd_camera_start(const lcd_camera_config_t *config) {
 		camera_config.pixel_format = PIXFORMAT_RGB565;
 	}
     ESP_ERROR_CHECK(esp_camera_init(&camera_config));
-
 #ifdef LCD_DISPLAY_EN
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
@@ -211,7 +219,7 @@ esp_err_t lcd_camera_start(const lcd_camera_config_t *config) {
 
     xTaskCreatePinnedToCore(display_task, "lcd_display", 8192, NULL, 4, NULL, 0);
 #endif
-    xTaskCreatePinnedToCore(stream_task, "stream_task", 8192, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(stream_task, "stream_task", 12288, NULL, 6, NULL, 1);
 
     return ESP_OK;
 }
