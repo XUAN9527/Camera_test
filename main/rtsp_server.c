@@ -13,7 +13,7 @@
 
 #define TAG "RTSP_SERVER"
 
-#define TCP_STREAM_ENABLE		 // TCP/UDP传输开关
+// #define TCP_STREAM_ENABLE		 // TCP/UDP传输开关
 // #define JPEG_DQT_CHECK
 
 #define RTSP_PORT 554
@@ -23,7 +23,7 @@
 #define MAX_PACKET_SIZE     1400
 #define RTP_MAX_PAYLOAD     (MAX_PACKET_SIZE - RTP_HEADER_SIZE - JPEG_HEADER_SIZE)
 
-#define FRAME_RATE 10
+#define FRAME_RATE 15
 #define FRAME_INTERVAL_US (1000000 / FRAME_RATE)
 
 // JPEG参数

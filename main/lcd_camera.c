@@ -11,15 +11,15 @@
 
 #define TAG "lcd_camera"
 
-// #define LCD_DISPLAY_EN	// 使能LCD显示
+#define LCD_DISPLAY_EN	// 使能LCD显示
 
 #define LCD_H_RES 320
 #define LCD_V_RES 240
-#define STREAM_FRAME_RATE 	10
-#define DISPLAY_FRAME_RATE 	10
+#define STREAM_FRAME_RATE 	15
+#define DISPLAY_FRAME_RATE 	15
 #define DISPLAY_SW_QUALITY	80 // 0~100
 
-bool use_hardware_jpeg = true;	// true：传感器采集jpeg直接传输；false：传感器采集rgb565->jpeg转换传输。此前提下，type = 0/1。
+bool use_hardware_jpeg = false;	// true：传感器采集jpeg直接传输；false：传感器采集rgb565->jpeg转换传输。此前提下，type = 0/1。
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static lcd_camera_config_t user_config;
 
@@ -133,41 +133,43 @@ static void display_task(void *arg) {
 #define JPEG_SOI1 0xD8
 #define JPEG_EOI0 0xFF
 #define JPEG_EOI1 0xD9
-#include "mbedtls/base64.h"
 
-static void debug_print_jpeg_base64(const uint8_t *data, size_t len)
-{
-    if (!data || len == 0) return;
+// #include "mbedtls/base64.h"
+// static void debug_print_jpeg_base64(const uint8_t *data, size_t len)
+// {
+//     if (!data || len == 0) return;
 
-    size_t encoded_len = 0;
-    mbedtls_base64_encode(NULL, 0, &encoded_len, data, len);
-    uint8_t *b64_buf = malloc(encoded_len + 1);
-    if (!b64_buf) {
-        ESP_LOGE(TAG, "base64 malloc failed");
-        return;
-    }
+//     size_t encoded_len = 0;
+//     mbedtls_base64_encode(NULL, 0, &encoded_len, data, len);
+//     uint8_t *b64_buf = malloc(encoded_len + 1);
+//     if (!b64_buf) {
+//         ESP_LOGE(TAG, "base64 malloc failed");
+//         return;
+//     }
 
-    if (mbedtls_base64_encode(b64_buf, encoded_len, &encoded_len, data, len) == 0) {
-        b64_buf[encoded_len] = 0;
-        printf("\n===== JPEG FRAME START =====\n%s\n===== JPEG FRAME END =====\n", b64_buf);
-    } else {
-        ESP_LOGE(TAG, "base64 encode failed");
-    }
+//     if (mbedtls_base64_encode(b64_buf, encoded_len, &encoded_len, data, len) == 0) {
+//         b64_buf[encoded_len] = 0;
+//         printf("\n===== JPEG FRAME START =====\n%s\n===== JPEG FRAME END =====\n", b64_buf);
+//     } else {
+//         ESP_LOGE(TAG, "base64 encode failed");
+//     }
 
-    free(b64_buf);
-}
+//     free(b64_buf);
+// }
 
 static void stream_task(void *arg) {
     while (1) {
-		camera_fb_t *fb = esp_camera_fb_get();
-		if (!fb) {
-            ESP_LOGE(TAG, "%s jpeg get failed!", use_hardware_jpeg ? "hardware" : "software");
-            vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
-            continue;
-        }
+		
 		// ESP_LOGI(TAG, "send_jpeg ptr: %p, stream_flag ptr: %p", user_config.send_jpeg, user_config.stream_flag);
 		if (user_config.send_jpeg && user_config.stream_flag && user_config.stream_flag())
 		{
+			camera_fb_t *fb = esp_camera_fb_get();
+			if (!fb) {
+				ESP_LOGE(TAG, "%s jpeg get failed!", use_hardware_jpeg ? "hardware" : "software");
+				vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
+				continue;
+			}
+
 			if (use_hardware_jpeg) {
 				if (fb->len > 100 && fb->buf[0] == JPEG_SOI0 && fb->buf[1] == JPEG_SOI1 &&
 					fb->buf[fb->len - 2] == JPEG_EOI0 && fb->buf[fb->len - 1] == JPEG_EOI1) 
@@ -193,8 +195,8 @@ static void stream_task(void *arg) {
 					ESP_LOGW(TAG, "SW JPEG encode failed");
 				}
 			}
+			esp_camera_fb_return(fb);
 		}
-		esp_camera_fb_return(fb);
 		vTaskDelay(pdMS_TO_TICKS(1000/STREAM_FRAME_RATE));
 	}
 }
@@ -217,9 +219,9 @@ esp_err_t lcd_camera_start(const lcd_camera_config_t *config) {
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
     panel_handle = audio_board_lcd_init(set, NULL);
 
-    xTaskCreatePinnedToCore(display_task, "lcd_display", 8192, NULL, 4, NULL, 0);
+    xTaskCreatePinnedToCore(display_task, "lcd_display", 8192, NULL, 5, NULL, 0);
 #endif
-    xTaskCreatePinnedToCore(stream_task, "stream_task", 12288, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCore(stream_task, "stream_task", 8192, NULL, 5, NULL, 1);
 
     return ESP_OK;
 }
