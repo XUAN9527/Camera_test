@@ -46,8 +46,8 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
     .pixel_format = PIXFORMAT_JPEG, // PIXFORMAT_RGB565, PIXFORMAT_JPEG
     .frame_size = FRAMESIZE_QVGA,
-    .jpeg_quality = 5,
-    .fb_count = 2,
+    .jpeg_quality = 7,
+    .fb_count = 3,
     .grab_mode = CAMERA_GRAB_LATEST,
     .fb_location = CAMERA_FB_IN_PSRAM,
 };
@@ -80,17 +80,25 @@ bool myjpg2rgb565(const uint8_t *src, size_t src_len, uint8_t * out, esp_jpeg_im
     return true;
 }
 
+static volatile bool fb_used = false;
 static void display_task(void *arg) {
     while (1) {
+		if(fb_used)
+		{
+			vTaskDelay(pdMS_TO_TICKS(1));
+			continue;
+		}
+		fb_used = true;
+
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
             ESP_LOGE(TAG, "%s jpeg get failed!", use_hardware_jpeg ? "hardware" : "software");
+			fb_used = false;
             vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
             continue;
         }
 
         const int lines = 40;
-
         if (!use_hardware_jpeg) {
             // RGB565 直显，无需转换
             for (int i = 0; i < LCD_V_RES / lines; i++) {
@@ -125,6 +133,7 @@ static void display_task(void *arg) {
         }
 
         esp_camera_fb_return(fb);
+		fb_used = false;
         vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
     }
 }
@@ -159,13 +168,20 @@ static void display_task(void *arg) {
 
 static void stream_task(void *arg) {
     while (1) {
-		
 		// ESP_LOGI(TAG, "send_jpeg ptr: %p, stream_flag ptr: %p", user_config.send_jpeg, user_config.stream_flag);
 		if (user_config.send_jpeg && user_config.stream_flag && user_config.stream_flag())
 		{
+			if(fb_used)
+			{
+				vTaskDelay(pdMS_TO_TICKS(1));
+				continue;
+			}
+
+			fb_used = true;
 			camera_fb_t *fb = esp_camera_fb_get();
 			if (!fb) {
 				ESP_LOGE(TAG, "%s jpeg get failed!", use_hardware_jpeg ? "hardware" : "software");
+				fb_used = false;
 				vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
 				continue;
 			}
@@ -196,6 +212,7 @@ static void stream_task(void *arg) {
 				}
 			}
 			esp_camera_fb_return(fb);
+			fb_used = false;
 		}
 		vTaskDelay(pdMS_TO_TICKS(1000/STREAM_FRAME_RATE));
 	}
@@ -214,12 +231,13 @@ esp_err_t lcd_camera_start(const lcd_camera_config_t *config) {
 		camera_config.pixel_format = PIXFORMAT_RGB565;
 	}
     ESP_ERROR_CHECK(esp_camera_init(&camera_config));
+	vTaskDelay(pdMS_TO_TICKS(300));
 #ifdef LCD_DISPLAY_EN
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
     panel_handle = audio_board_lcd_init(set, NULL);
 
-    xTaskCreatePinnedToCore(display_task, "lcd_display", 8192, NULL, 5, NULL, 0);
+    xTaskCreatePinnedToCore(display_task, "lcd_display", 8192, NULL, 4, NULL, 0);
 #endif
     xTaskCreatePinnedToCore(stream_task, "stream_task", 8192, NULL, 5, NULL, 1);
 

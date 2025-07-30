@@ -16,7 +16,7 @@
 extern "C" {
 #endif  /* __cplusplus */
 
-void wifi_init_softap(void);
+void wifi_user_init(void);
 
 
 #ifdef __cplusplus

@@ -34,7 +34,7 @@ static bool stream_flag_callback(void) {
 
 void app_main(void) {
     
-    wifi_init_softap();		// 初始化 SoftAP
+    wifi_user_init();		// 初始化 SoftAP
 #if PUSH_STREAM_MODE == 1
 	http_server_start();    // 启动HTTP服务器
 #elif PUSH_STREAM_MODE == 2
