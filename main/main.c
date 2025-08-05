@@ -8,6 +8,8 @@
 #include "web_mjpeg_server.h"
 
 #define TAG "main"
+#define STRING_PROJECT_NAME "Camera Display"
+#define STRING_VERSION 		"A1.01"
 
 #define PUSH_STREAM_MODE	2
 
@@ -32,8 +34,17 @@ static bool stream_flag_callback(void) {
 #endif	
 }
 
+static void version_info_print(void)
+{
+    printf("\nThread Operating System\n");
+	printf("build  %s %s\n",__DATE__, __TIME__);
+	printf("Project Name     =  [%s]\n",STRING_PROJECT_NAME);
+	printf("Project Version  =  [%s]\n",STRING_VERSION);
+    printf("2024 - 2025 Copyright by breo team\n");
+}
+
 void app_main(void) {
-    
+    version_info_print();
     wifi_user_init();		// 初始化 SoftAP
 #if PUSH_STREAM_MODE == 1
 	http_server_start();    // 启动HTTP服务器
