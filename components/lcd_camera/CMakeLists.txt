@@ -1,0 +1,16 @@
+idf_component_register(
+	SRCS 
+		"lcd_camera.c"
+    INCLUDE_DIRS 
+		"include"
+	REQUIRES
+		driver
+		esp_lcd
+		esp_peripherals
+		audio_board
+		freertos
+		esp_system
+		esp_event
+		log
+		esp32-camera
+)
