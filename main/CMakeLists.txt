@@ -10,4 +10,5 @@ idf_component_register(
 		rtsp_server
 		wifi_softap
 		log
+		letter_shell
 )

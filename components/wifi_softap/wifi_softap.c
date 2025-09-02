@@ -9,7 +9,7 @@
 #include "wifi_softap.h"
 
 // 定义是否使用 WiFi STA 模式，否则使用 SoftAP 模式
-#define USE_WIFI_STA 0
+#define USE_WIFI_STA 1
 
 static const char *TAG = "WiFi_Module";
 

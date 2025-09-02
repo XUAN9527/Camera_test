@@ -1,7 +1,8 @@
 .config
 *.o
 *.pyc
-
+*.lock
+*.old
 build/
 managed_components/
 .vscode
