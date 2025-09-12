@@ -7,6 +7,8 @@
 #include "freertos/queue.h"
 #include "board.h"
 #include <string.h>
+#include <stdlib.h>
+#include <stdint.h>
 
 #define TAG "lcd_camera"
 
@@ -18,7 +20,7 @@
 #define DISPLAY_FRAME_RATE 	15
 #define DISPLAY_SW_QUALITY	80 // 0~100
 
-bool use_hardware_jpeg = false;	// true：传感器采集jpeg直接传输；false：传感器采集rgb565->jpeg转换传输。此前提下，type = 0/1。
+// SC101 不支持硬件 JPEG，强制软件路径
 static esp_lcd_panel_handle_t panel_handle = NULL;
 static lcd_camera_config_t user_config;
 
@@ -43,7 +45,7 @@ static camera_config_t camera_config = {
     .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
     .ledc_channel = LEDC_CHANNEL_0,
-    .pixel_format = PIXFORMAT_JPEG, // PIXFORMAT_RGB565, PIXFORMAT_JPEG
+    .pixel_format = PIXFORMAT_YUV422, // or PIXFORMAT_RGB565
     .frame_size = FRAMESIZE_QVGA,
     .jpeg_quality = 7,
     .fb_count = 3,
@@ -51,170 +53,185 @@ static camera_config_t camera_config = {
     .fb_location = CAMERA_FB_IN_PSRAM,
 };
 
-esp_lcd_panel_handle_t lcd_camera_get_panel(void) {
-    return panel_handle;
+////////////////////////////////////////////////////////////////////////////////
+// YUV422 (YUYV: Y0 U Y1 V) -> RGB565 conversion
+// Notes:
+//  - Input: src points to YUV422 buffer (fb->buf), length should be width*height*2
+//  - Output: dst is width*height*2 bytes (RGB565 little-endian by default).
+//  - SWAP_BYTE_OUTPUT: if your LCD expects swapped byte order, set to 1.
+//    You observed earlier JPEG decode needed swap_color_bytes=1; 若颜色/字节顺序不对，改为 1。
+////////////////////////////////////////////////////////////////////////////////
+#define SWAP_RGB565_BYTES 0
+
+static inline int clamp(int v) {
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return v;
 }
 
-// jpg2rgb565原始函数显示花屏，需要.flags.swap_color_bytes = 1
-static uint8_t work[3100];
-bool myjpg2rgb565(const uint8_t *src, size_t src_len, uint8_t * out, esp_jpeg_image_scale_t scale)
+static void yuv422_to_rgb565(const uint8_t *src, uint8_t *dst, int width, int height)
 {
-    esp_jpeg_image_cfg_t jpeg_cfg = {
-        .indata = (uint8_t *)src,
-        .indata_size = src_len,
-        .outbuf = out,
-        .outbuf_size = UINT32_MAX, // @todo: this is very bold assumption, keeping this like this for now, not to break existing code
-        .out_format = JPEG_IMAGE_FORMAT_RGB565,
-        .out_scale = scale,
-        .flags.swap_color_bytes = 1,
-        .advanced.working_buffer = work,
-        .advanced.working_buffer_size = sizeof(work),
-    };
+    // src length = width * height * 2
+    // dst length = width * height * 2 (uint16 per pixel)
+    const uint8_t *s = src;
+    uint8_t *d = dst;
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x += 2) {
+            // Y0 U Y1 V
+            int Y0 = s[0];
+            int U  = s[1];
+            int Y1 = s[2];
+            int V  = s[3];
+            s += 4;
 
-    esp_jpeg_image_output_t output_img = {};
+            int C0 = Y0 - 16;
+            int C1 = Y1 - 16;
+            int D = U - 128;
+            int E = V - 128;
 
-    if(esp_jpeg_decode(&jpeg_cfg, &output_img) != ESP_OK){
-        return false;
+            // using integer arithmetic similar to ITU-R BT.601
+            int R0 = (298 * C0 + 409 * E + 128) >> 8;
+            int G0 = (298 * C0 - 100 * D - 208 * E + 128) >> 8;
+            int B0 = (298 * C0 + 516 * D + 128) >> 8;
+
+            int R1 = (298 * C1 + 409 * E + 128) >> 8;
+            int G1 = (298 * C1 - 100 * D - 208 * E + 128) >> 8;
+            int B1 = (298 * C1 + 516 * D + 128) >> 8;
+
+            R0 = clamp(R0); G0 = clamp(G0); B0 = clamp(B0);
+            R1 = clamp(R1); G1 = clamp(G1); B1 = clamp(B1);
+
+            uint16_t p0 = ((R0 >> 3) << 11) | ((G0 >> 2) << 5) | (B0 >> 3);
+            uint16_t p1 = ((R1 >> 3) << 11) | ((G1 >> 2) << 5) | (B1 >> 3);
+
+            if (SWAP_RGB565_BYTES) {
+                // write little endian swapped bytes if LCD expects that
+                d[0] = (uint8_t)(p0 & 0xFF);
+                d[1] = (uint8_t)(p0 >> 8);
+                d[2] = (uint8_t)(p1 & 0xFF);
+                d[3] = (uint8_t)(p1 >> 8);
+            } else {
+                // big endian order
+                d[0] = (uint8_t)(p0 >> 8);
+                d[1] = (uint8_t)(p0 & 0xFF);
+                d[2] = (uint8_t)(p1 >> 8);
+                d[3] = (uint8_t)(p1 & 0xFF);
+            }
+            d += 4;
+        }
     }
-    return true;
 }
+
+////////////////////////////////////////////////////////////////////////////////
 
 static volatile bool fb_used = false;
 static void display_task(void *arg) {
+    const int lines = 40; // 分块绘制行数，可调
     while (1) {
-		if(fb_used)
-		{
-			vTaskDelay(pdMS_TO_TICKS(1));
-			continue;
-		}
-		fb_used = true;
+        if(fb_used) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        fb_used = true;
 
         camera_fb_t *fb = esp_camera_fb_get();
         if (!fb) {
-            ESP_LOGE(TAG, "%s jpeg get failed!", use_hardware_jpeg ? "hardware" : "software");
-			fb_used = false;
+            ESP_LOGE(TAG, "FB get failed!");
+            fb_used = false;
             vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
             continue;
         }
 
-        const int lines = 40;
-        if (!use_hardware_jpeg) {
-            // RGB565 直显，无需转换
-            for (int i = 0; i < LCD_V_RES / lines; i++) {
-                esp_lcd_panel_draw_bitmap(panel_handle,
-                                          0, i * lines,
-                                          LCD_H_RES, (i + 1) * lines,
-                                          fb->buf + i * lines * LCD_H_RES * 2);
-            }
-        } else {
-            // JPEG 解码为 RGB565 后显示
-            size_t rgb565_len = LCD_H_RES * LCD_V_RES * 2;
+        if (fb->format == PIXFORMAT_YUV422) {
+            // YUV422 → RGB565
+            size_t rgb565_len = fb->width * fb->height * 2;
             uint8_t *rgb565_buf = (uint8_t *)heap_caps_malloc(rgb565_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (rgb565_buf == NULL) {
+            if (!rgb565_buf) {
                 ESP_LOGE(TAG, "Failed to allocate RGB565 buffer");
                 esp_camera_fb_return(fb);
+                fb_used = false;
                 vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
                 continue;
             }
 
-            if (myjpg2rgb565(fb->buf, fb->len, rgb565_buf, JPEG_IMAGE_SCALE_0)) {
-                for (int i = 0; i < LCD_V_RES / lines; i++) {
-                    esp_lcd_panel_draw_bitmap(panel_handle,
-                                              0, i * lines,
-                                              LCD_H_RES, (i + 1) * lines,
-                                              rgb565_buf + i * lines * LCD_H_RES * 2);
-                }
-            } else {
-                ESP_LOGE(TAG, "JPEG to RGB565 decode failed");
+            yuv422_to_rgb565(fb->buf, rgb565_buf, fb->width, fb->height);
+
+            for (int i = 0; i < fb->height / lines; i++) {
+                esp_lcd_panel_draw_bitmap(panel_handle,
+                                          0, i * lines,
+                                          fb->width, (i + 1) * lines,
+                                          rgb565_buf + i * lines * fb->width * 2);
             }
 
             heap_caps_free(rgb565_buf);
+        } 
+        else if (fb->format == PIXFORMAT_RGB565) {
+            // RGB565 直出
+            for (int i = 0; i < fb->height / lines; i++) {
+                esp_lcd_panel_draw_bitmap(panel_handle,
+                                          0, i * lines,
+                                          fb->width, (i + 1) * lines,
+                                          fb->buf + i * lines * fb->width * 2);
+            }
+        }
+        else {
+            ESP_LOGE(TAG, "Unsupported FB format: %d", fb->format);
         }
 
         esp_camera_fb_return(fb);
-		fb_used = false;
+        fb_used = false;
         vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
     }
 }
 
-#define JPEG_SOI0 0xFF
-#define JPEG_SOI1 0xD8
-#define JPEG_EOI0 0xFF
-#define JPEG_EOI1 0xD9
-
-// #include "mbedtls/base64.h"
-// static void debug_print_jpeg_base64(const uint8_t *data, size_t len)
-// {
-//     if (!data || len == 0) return;
-
-//     size_t encoded_len = 0;
-//     mbedtls_base64_encode(NULL, 0, &encoded_len, data, len);
-//     uint8_t *b64_buf = malloc(encoded_len + 1);
-//     if (!b64_buf) {
-//         ESP_LOGE(TAG, "base64 malloc failed");
-//         return;
-//     }
-
-//     if (mbedtls_base64_encode(b64_buf, encoded_len, &encoded_len, data, len) == 0) {
-//         b64_buf[encoded_len] = 0;
-//         printf("\n===== JPEG FRAME START =====\n%s\n===== JPEG FRAME END =====\n", b64_buf);
-//     } else {
-//         ESP_LOGE(TAG, "base64 encode failed");
-//     }
-
-//     free(b64_buf);
-// }
-
 static void stream_task(void *arg) {
     while (1) {
-		// ESP_LOGI(TAG, "send_jpeg ptr: %p, stream_flag ptr: %p", user_config.send_jpeg, user_config.stream_flag);
-		if (user_config.send_jpeg && user_config.stream_flag && user_config.stream_flag())
-		{
-			if(fb_used)
-			{
-				vTaskDelay(pdMS_TO_TICKS(1));
-				continue;
-			}
+        if (user_config.send_jpeg && user_config.stream_flag && user_config.stream_flag())
+        {
+            if(fb_used)
+            {
+                vTaskDelay(pdMS_TO_TICKS(1));
+                continue;
+            }
 
-			fb_used = true;
-			camera_fb_t *fb = esp_camera_fb_get();
-			if (!fb) {
-				ESP_LOGE(TAG, "%s jpeg get failed!", use_hardware_jpeg ? "hardware" : "software");
-				fb_used = false;
-				vTaskDelay(pdMS_TO_TICKS(1000 / DISPLAY_FRAME_RATE));
-				continue;
-			}
+            fb_used = true;
+            camera_fb_t *fb = esp_camera_fb_get();
+            if (!fb) {
+                fb_used = false;
+                vTaskDelay(pdMS_TO_TICKS(1000 / STREAM_FRAME_RATE));
+                continue;
+            }
 
-			if (use_hardware_jpeg) {
-				if (fb->len > 100 && fb->buf[0] == JPEG_SOI0 && fb->buf[1] == JPEG_SOI1 &&
-					fb->buf[fb->len - 2] == JPEG_EOI0 && fb->buf[fb->len - 1] == JPEG_EOI1) 
-				{
-					uint8_t type = fb->format == PIXFORMAT_JPEG ? 0 : 1;
-					user_config.send_jpeg(fb->buf, fb->len, type);
-					// 添加这一行，仅打印前几帧检查
-					// static int printed = 0;
-					// if (printed++ < 3) {
-					// 	debug_print_jpeg_base64(fb->buf, fb->len);
-					// }
-				} else {
-					ESP_LOGW(TAG, "Invalid HW JPEG frame, skipping...");
-				}
-			} else {
-				uint8_t *jpeg_buf = NULL;
-				size_t jpeg_len = 0;
-				if (frame2jpg(fb, DISPLAY_SW_QUALITY, &jpeg_buf, &jpeg_len)) {
-					uint8_t type = fb->format == PIXFORMAT_JPEG ? 0 : 1;
-					user_config.send_jpeg(jpeg_buf, jpeg_len, type);
-					free(jpeg_buf);
-				} else {
-					ESP_LOGW(TAG, "SW JPEG encode failed");
-				}
-			}
-			esp_camera_fb_return(fb);
-			fb_used = false;
-		}
-		vTaskDelay(pdMS_TO_TICKS(1000/STREAM_FRAME_RATE));
-	}
+            uint8_t *jpeg_buf = NULL;
+            size_t jpeg_len = 0;
+
+            // 直接使用 YUV422 转 JPEG
+            if (fb->format == PIXFORMAT_YUV422) {
+                if (frame2jpg(fb, DISPLAY_SW_QUALITY, &jpeg_buf, &jpeg_len)) {
+                    user_config.send_jpeg(jpeg_buf, jpeg_len, 1); // type=1 表示软件 JPEG
+                    free(jpeg_buf);
+                } else {
+                    ESP_LOGW(TAG, "SW JPEG encode failed");
+                }
+            }
+            // 如果未来有 RGB565 FB
+            else if (fb->format == PIXFORMAT_RGB565) {
+                if (frame2jpg(fb, DISPLAY_SW_QUALITY, &jpeg_buf, &jpeg_len)) {
+                    user_config.send_jpeg(jpeg_buf, jpeg_len, 1);
+                    free(jpeg_buf);
+                } else {
+                    ESP_LOGW(TAG, "SW JPEG encode failed");
+                }
+            }
+            else {
+                ESP_LOGE(TAG, "Unsupported FB format: %d", fb->format);
+            }
+
+            esp_camera_fb_return(fb);
+            fb_used = false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000/STREAM_FRAME_RATE));
+    }
 }
 
 esp_err_t lcd_camera_start(const lcd_camera_config_t *config) {
@@ -224,11 +241,6 @@ esp_err_t lcd_camera_start(const lcd_camera_config_t *config) {
     }
 
     user_config = *config;
-	if (use_hardware_jpeg) {
-		camera_config.pixel_format = PIXFORMAT_JPEG;
-	} else {
-		camera_config.pixel_format = PIXFORMAT_RGB565;
-	}
     ESP_ERROR_CHECK(esp_camera_init(&camera_config));
 	vTaskDelay(pdMS_TO_TICKS(300));
 #ifdef LCD_DISPLAY_EN
