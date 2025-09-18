@@ -9,7 +9,7 @@
 #include "wifi_softap.h"
 
 // 定义是否使用 WiFi STA 模式，否则使用 SoftAP 模式
-#define USE_WIFI_STA 1
+#define USE_WIFI_STA 0
 
 static const char *TAG = "WiFi_Module";
 
@@ -64,24 +64,17 @@ void wifi_user_init() {
     esp_netif_create_default_wifi_sta();
 #else
     // AP 模式
-    esp_netif_create_default_wifi_ap();
+    esp_netif_t *ap_netif = esp_netif_create_default_wifi_ap();
 #endif
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // 注册事件处理器
 #if USE_WIFI_STA
+	// ====== STA 模式 ======
 	ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
 	ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
-#else
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED,
-                                                        &wifi_event_handler, NULL, NULL));
-#endif
-	
 
-#if USE_WIFI_STA
-    // STA 模式配置
     wifi_config_t wifi_config = {
         .sta = {
             .ssid = WIFI_STA_SSID,
@@ -97,7 +90,18 @@ void wifi_user_init() {
     ESP_LOGI(TAG, "WiFi STA started. Connecting to SSID: %s, PASSWORD: %s", WIFI_STA_SSID, WIFI_STA_PASSWORD);
 	ESP_LOGI(TAG, "Waiting for WiFi to connect...");
 #else
-    // AP 模式配置
+	// ====== AP 模式 ====== 手动配置 AP IP（例如 192.168.4.1）
+    esp_netif_ip_info_t ip_info;
+    IP4_ADDR(&ip_info.ip, 192, 168, 4, 1);
+    IP4_ADDR(&ip_info.gw, 192, 168, 4, 1);
+    IP4_ADDR(&ip_info.netmask, 255, 255, 255, 0);
+
+    ESP_ERROR_CHECK(esp_netif_dhcps_stop(ap_netif));                // 1. 停止 DHCP
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(ap_netif, &ip_info));     // 2. 设置 IP
+    ESP_ERROR_CHECK(esp_netif_dhcps_start(ap_netif));               // 3. 重新开启 DHCP
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_AP_STAIPASSIGNED,
+                                                        &wifi_event_handler, NULL, NULL));
     wifi_config_t wifi_config = {
         .ap = {
             .ssid = WIFI_AP_SSID,
@@ -111,6 +115,7 @@ void wifi_user_init() {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "WiFi AP started. SSID: %s", WIFI_AP_SSID);
+
+    ESP_LOGI(TAG, "WiFi AP started. SSID:%s, IP:" IPSTR, WIFI_AP_SSID, IP2STR(&ip_info.ip));
 #endif
 }

@@ -11,7 +11,7 @@
 
 #define TAG "main"
 #define STRING_PROJECT_NAME "Camera Display"
-#define STRING_VERSION 		"A1.03"
+#define STRING_VERSION 		"A1.04"
 
 #define PUSH_STREAM_MODE	2
 

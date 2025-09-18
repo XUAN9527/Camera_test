@@ -439,37 +439,30 @@ static bool jpeg_has_dqt(const uint8_t *data, size_t len) {
 #endif
 
 void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
-    if (!rtsp_streaming || (!use_tcp_transport && udp_sock < 0) || len < 2) {
-        return;
-    }
+    if (!rtsp_streaming || (!use_tcp_transport && udp_sock < 0) || len < 2) return;
 
     static uint16_t seq = 0;
     static uint32_t ssrc = 0x12345678;
     static uint32_t rtp_timestamp = 0;
 
-    uint64_t now_us = esp_timer_get_time();
-    uint64_t frame_start_us = now_us;
+    static uint8_t rtp_pkt_buf[RTP_HEADER_SIZE + JPEG_HEADER_SIZE + RTP_MAX_PAYLOAD];
+
+    uint64_t frame_start_us = esp_timer_get_time();
     rtp_timestamp += 90000 / FRAME_RATE;
 
     if (jpeg[0] != 0xFF || jpeg[1] != 0xD8) {
-        ESP_LOGW(TAG, "Invalid JPEG header: %02X %02X", jpeg[0], jpeg[1]);
+        ESP_LOGW(TAG, "Invalid JPEG header");
         return;
     }
-#ifdef JPEG_DQT_CHECK
-	// 检测是否包含 DQT，决定 RTP JPEG Type
-	bool has_dqt = jpeg_has_dqt(jpeg, len);
-	uint8_t type = has_dqt ? 0 : 1;
-	ESP_LOGI(TAG, "JPEG header: %02X %02X, has_dqt=%s → type=%d", jpeg[0], jpeg[1], has_dqt ? "YES" : "NO", type);
-#endif
-    // 帧统计
+
     frame_count++;
-    uint64_t now_ms = now_us / 1000;
+    uint64_t now_ms = frame_start_us / 1000;
     if (now_ms - last_stat_time >= 1000) {
-        float loss_rate = error_count ? (error_count * 100.0f) / (packet_count + error_count) : 0;
+        float loss_rate = (packet_count + error_count) ? ((float)error_count * 100) / (packet_count + error_count) : 0;
         ESP_LOGI(TAG, "Streaming: %u FPS, %u pkts, %u bytes, %u errs (%.1f%%)",
                  (unsigned int)frame_count,
                  (unsigned int)packet_count,
-				 (unsigned int)len,
+                 (unsigned int)len,
                  (unsigned int)error_count,
                  loss_rate);
         frame_count = 0;
@@ -479,60 +472,40 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
     }
 
     size_t offset = 0;
-    uint16_t frame_start_seq = seq;
     bool frame_failed = false;
 
     while (offset < len) {
-        // 超时检查（整个帧）
         if (esp_timer_get_time() - frame_start_us > RTP_FRAME_TIMEOUT_US) {
-            ESP_LOGW(TAG, "Drop frame due to timeout (>%d us)", RTP_FRAME_TIMEOUT_US);
+            ESP_LOGW(TAG, "Drop frame due to timeout");
             error_count++;
             return;
         }
 
         size_t chunk = (len - offset > RTP_MAX_PAYLOAD) ? RTP_MAX_PAYLOAD : (len - offset);
-
-		// 调试日志（临时添加）
-		// ESP_LOGI(TAG, "Preparing pkt: offset=%d, chunk=%d, total=%d", 
-		// 		(int)offset, (int)chunk, (int)len);
-
-		// 验证分包合理性
-		if (chunk == 0 || chunk > RTP_MAX_PAYLOAD) {
-			ESP_LOGE(TAG, "Invalid chunk size: %d", (int)chunk);
-			break;
-		}
-
-        bool is_first = (offset == 0);
-        bool is_last = ((offset + chunk) >= len);
-
-        uint8_t pkt[12 + 8 + chunk];
         int i = 0;
 
         // RTP Header
-        pkt[i++] = 0x80;
-        pkt[i++] = (is_last ? 0x80 : 0x00) | RTP_PAYLOAD_TYPE_MJPEG;
-        pkt[i++] = (seq >> 8) & 0xFF;
-        pkt[i++] = seq & 0xFF;
-        pkt[i++] = (rtp_timestamp >> 24) & 0xFF;
-        pkt[i++] = (rtp_timestamp >> 16) & 0xFF;
-        pkt[i++] = (rtp_timestamp >> 8) & 0xFF;
-        pkt[i++] = rtp_timestamp & 0xFF;
-        pkt[i++] = (ssrc >> 24) & 0xFF;
-        pkt[i++] = (ssrc >> 16) & 0xFF;
-        pkt[i++] = (ssrc >> 8) & 0xFF;
-        pkt[i++] = ssrc & 0xFF;
+        rtp_pkt_buf[i++] = 0x80;
+        rtp_pkt_buf[i++] = ((offset + chunk >= len) ? 0x80 : 0x00) | RTP_PAYLOAD_TYPE_MJPEG;
+        rtp_pkt_buf[i++] = (seq >> 8) & 0xFF; rtp_pkt_buf[i++] = seq & 0xFF;
+        rtp_pkt_buf[i++] = (rtp_timestamp >> 24) & 0xFF;
+        rtp_pkt_buf[i++] = (rtp_timestamp >> 16) & 0xFF;
+        rtp_pkt_buf[i++] = (rtp_timestamp >> 8) & 0xFF;
+        rtp_pkt_buf[i++] = rtp_timestamp & 0xFF;
+        rtp_pkt_buf[i++] = (ssrc >> 24) & 0xFF; rtp_pkt_buf[i++] = (ssrc >> 16) & 0xFF;
+        rtp_pkt_buf[i++] = (ssrc >> 8) & 0xFF; rtp_pkt_buf[i++] = ssrc & 0xFF;
 
         // JPEG Payload Header
-        pkt[i++] = is_first ? 0x00 : 0x80;
-        pkt[i++] = (offset >> 16) & 0xFF;
-        pkt[i++] = (offset >> 8) & 0xFF;
-        pkt[i++] = offset & 0xFF;
-        pkt[i++] = type;
-        pkt[i++] = JPEG_QUALITY;
-        pkt[i++] = DISPLAY_H_RES;
-        pkt[i++] = DISPLAY_V_RES;
+        rtp_pkt_buf[i++] = (offset == 0) ? 0x00 : 0x80;
+        rtp_pkt_buf[i++] = (offset >> 16) & 0xFF;
+        rtp_pkt_buf[i++] = (offset >> 8) & 0xFF;
+        rtp_pkt_buf[i++] = offset & 0xFF;
+        rtp_pkt_buf[i++] = type;
+        rtp_pkt_buf[i++] = JPEG_QUALITY;
+        rtp_pkt_buf[i++] = DISPLAY_H_RES;
+        rtp_pkt_buf[i++] = DISPLAY_V_RES;
 
-        memcpy(pkt + i, jpeg + offset, chunk);
+        memcpy(rtp_pkt_buf + i, jpeg + offset, chunk);
         i += chunk;
 
         int retry = 0;
@@ -540,63 +513,44 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
         int sent = -1;
         bool fatal = false;
 
-        do {
+        while (sent < 0 && retry <= RTP_RETRY_LIMIT && !fatal) {
             if (use_tcp_transport) {
                 uint8_t tcp_pkt[4 + i];
-                tcp_pkt[0] = '$';
-                tcp_pkt[1] = 0x00;
-                tcp_pkt[2] = (i >> 8) & 0xFF;
-                tcp_pkt[3] = i & 0xFF;
-                memcpy(tcp_pkt + 4, pkt, i);
+                tcp_pkt[0] = '$'; tcp_pkt[1] = 0x00;
+                tcp_pkt[2] = (i >> 8) & 0xFF; tcp_pkt[3] = i & 0xFF;
+                memcpy(tcp_pkt + 4, rtp_pkt_buf, i);
                 sent = send(rtsp_client_socket, tcp_pkt, i + 4, 0);
             } else {
-                sent = sendto(udp_sock, pkt, i, 0,
-                              (struct sockaddr *)&udp_client_addr,
-                              sizeof(udp_client_addr));
+                sent = sendto(udp_sock, rtp_pkt_buf, i, 0,
+                              (struct sockaddr *)&udp_client_addr, sizeof(udp_client_addr));
             }
 
             if (sent < 0) {
-				int err = errno;
-
-				// 针对 UDP 特定错误进行分级处理
-				if (err == EAGAIN || err == ENOMEM || err == ENOBUFS) {
-					if (retry < RTP_RETRY_LIMIT) {  // 限制最大重试次数
-						ESP_LOGW(TAG, "Send retry #%d at offset %u: errno=%d (%s)",
-								retry, (unsigned int)offset, err, strerror(err));
-						vTaskDelay(pdMS_TO_TICKS(delay));
-						retry++;
-						delay = delay * 2 > 50 ? 50 : delay * 2;  // 延迟指数退避，最大不超 50ms
-					} else {
-						ESP_LOGE(TAG, "Retry limit reached (%d) at offset %u, drop packet",
-								retry, (unsigned int)offset);
-						break;  // 超过重试次数，丢弃该 RTP 包
-					}
-				} else {
-					fatal = true;
-					rtsp_streaming = false;
-					ESP_LOGE(TAG, "Fatal send error: errno=%d (%s)", err, strerror(err));
-					break;
-				}
-    		}
-		} while (sent < 0 && !fatal);
+                int err = errno;
+                if (err == EAGAIN || err == ENOMEM || err == ENOBUFS) {
+                    vTaskDelay(pdMS_TO_TICKS(delay));
+                    retry++;
+                    delay = (delay * 2 > 50) ? 50 : delay * 2;
+                    if (retry > RTP_RETRY_LIMIT) break;
+                } else {
+                    fatal = true;
+                    rtsp_streaming = false;
+                    ESP_LOGE(TAG, "Fatal send error: %d", err);
+                    break;
+                }
+            }
+        }
 
         if (sent < 0) {
             error_count++;
-#if RTP_ENABLE_DROP_FRAME
-			// 11=EAGAIN:socket buffer 满; 12=ENOMEM,内存不足（通常是 LWIP 内部）;104=ECONNRESET,客户端断开连接；113=EHOSTUNREACH，客户端地址不可达
-           	ESP_LOGW(TAG, "Sendto failed at offset %u, errno=%d (%s)", (unsigned int)offset, errno, strerror(errno));
-            frame_failed = true;
-#endif
-			if (offset == 0) {
-				// 首包失败，整帧不可用
-				ESP_LOGW(TAG, "Drop frame due to send failure at offset 0 (critical)");
-				vTaskDelay(pdMS_TO_TICKS(100));  // 加一段等待，缓解发送拥堵
-				frame_failed = true;
-				break;
-			} else {
-				// 非首包失败，标记但继续传输（可选）
-				ESP_LOGW(TAG, "Non-first packet failed at offset %u, continuing", offset);
-			}
+            if (offset == 0) {
+                frame_failed = true; // 首包失败，重试或丢弃
+                vTaskDelay(pdMS_TO_TICKS(5));
+                break;
+            } else {
+                // 非首包失败，直接跳过
+                ESP_LOGW(TAG, "RTP packet lost, continue remaining packets");
+            }
         } else {
             packet_count++;
         }
@@ -606,27 +560,22 @@ void rtsp_server_send_frame(uint8_t *jpeg, size_t len, uint8_t type) {
     }
 
     if (!frame_failed) {
-        ESP_LOGD(TAG, "Frame complete: start_seq=%u, end_seq=%u, packets=%d",
-                 frame_start_seq, seq - 1, (seq - frame_start_seq));
-		// ✅ 在帧成功发送后延迟 1ms 让出 CPU，降低系统负载
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    static uint64_t last_rtcp = 0;
-    if (now_us - last_rtcp > 5000000) {
+    // RTCP SR 每5秒发送
+    static uint64_t last_rtcp_us = 0;
+    uint64_t now_us = esp_timer_get_time();
+    if (now_us - last_rtcp_us > 5000000) {
         send_rtcp_sr_report(now_us / 1000, rtp_timestamp);
-        last_rtcp = now_us;
+        last_rtcp_us = now_us;
     }
-	
-	// 根据帧处理时间动态延迟，避免帧率过快导致负载高
-    uint64_t frame_used_us = esp_timer_get_time() - frame_start_us;
-    uint64_t frame_interval_us = 1000000 / FRAME_RATE;
-    int wait_ms = (int)((frame_interval_us > frame_used_us) ? (frame_interval_us - frame_used_us) / 1000 : 0);
-	if (wait_ms > 0 && wait_ms < 50) {
-		vTaskDelay(pdMS_TO_TICKS(wait_ms));
-	}
-}
 
+    // 固定帧率控制 15 FPS
+    uint64_t frame_used_us = esp_timer_get_time() - frame_start_us;
+    int wait_ms = (int)((FRAME_INTERVAL_US > frame_used_us) ? (FRAME_INTERVAL_US - frame_used_us) / 1000 : 0);
+    if (wait_ms > 0) vTaskDelay(pdMS_TO_TICKS(wait_ms));
+}
 
 void rtsp_server_start(void) {
     xTaskCreatePinnedToCore(rtsp_server_task, "rtsp_server", 8192, NULL, 5, NULL, 1);
