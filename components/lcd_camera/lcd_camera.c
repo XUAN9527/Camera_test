@@ -193,7 +193,6 @@ esp_err_t lcd_camera_start(const lcd_camera_config_t *config){
 
     user_config = *config;
     ESP_ERROR_CHECK(esp_camera_init(&camera_config));
-    vTaskDelay(pdMS_TO_TICKS(300));
 #ifdef LCD_DISPLAY_EN
     esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
     esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);

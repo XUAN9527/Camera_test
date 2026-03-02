@@ -1,3 +1,4 @@
 dependencies:
   esp32-camera:
     git: git@github.com:espressif/esp32-camera.git
+  # esp_lcd_ili9341: "^1"
