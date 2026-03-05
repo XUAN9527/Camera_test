@@ -2,10 +2,13 @@
 #include "esp_camera.h"
 #include "esp_log.h"
 #include "esp_lcd_panel_ops.h"
+#include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/queue.h"
-#include "board.h"
+#include "freertos/semphr.h"
+#include "freertos/portmacro.h"
+#include "board_lcd.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -51,33 +54,70 @@ static camera_config_t camera_config = {
     .fb_location = CAMERA_FB_IN_PSRAM,
 };
 
-#define SWAP_RGB565_BYTES 0
+#define SWAP_RGB565_BYTES 0  // 改回0，测试大端字节顺序
 static inline int clamp(int v) {
     if (v < 0) return 0;
     if (v > 255) return 255;
     return v;
 }
 
+// 更准确的YUV422到RGB565转换函数
 static void yuv422_to_rgb565(const uint8_t *src, uint8_t *dst, int width, int height) {
     const uint8_t *s = src;
     uint8_t *d = dst;
+    
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x += 2) {
-            int Y0 = s[0], U = s[1], Y1 = s[2], V = s[3];
+            // 读取YUV422数据 (Y0, U, Y1, V)
+            int Y0 = s[0];
+            int U  = s[1];
+            int Y1 = s[2];
+            int V  = s[3];
             s += 4;
-            int C0 = Y0-16, C1 = Y1-16, D=U-128, E=V-128;
-            int R0=(298*C0+409*E+128)>>8, G0=(298*C0-100*D-208*E+128)>>8, B0=(298*C0+516*D+128)>>8;
-            int R1=(298*C1+409*E+128)>>8, G1=(298*C1-100*D-208*E+128)>>8, B1=(298*C1+516*D+128)>>8;
-            R0=clamp(R0); G0=clamp(G0); B0=clamp(B0);
-            R1=clamp(R1); G1=clamp(G1); B1=clamp(B1);
-            uint16_t p0 = ((R0>>3)<<11)|((G0>>2)<<5)|(B0>>3);
-            uint16_t p1 = ((R1>>3)<<11)|((G1>>2)<<5)|(B1>>3);
+            
+			// 转换为RGB (ITU-R BT.601标准，标准U/V顺序)
+			int C = Y0 - 16;
+			int D = U - 128;  // D = U-128
+			int E = V - 128;  // E = V-128
+			
+			// 进一步调整系数以减少蓝色偏色（手机显示正常说明摄像头数据OK）
+			int R = (298 * C + 409 * E + 128) >> 8;
+			int G = (298 * C - 100 * D - 208 * E + 128) >> 8;
+			int B = (298 * C + 420 * D + 128) >> 8;  // 再次降低蓝色系数从440到420
+            
+            R = clamp(R);
+            G = clamp(G);
+            B = clamp(B);
+            
+            // 标准RGB565格式，LCD驱动已设置为BGR模式
+            uint16_t p0 = ((R >> 3) << 11) | ((G >> 2) << 5) | (B >> 3);
+            
+            // 第二个像素
+            C = Y1 - 16;
+            
+            R = (298 * C + 409 * E + 128) >> 8;
+            G = (298 * C - 100 * D - 208 * E + 128) >> 8;
+            B = (298 * C + 420 * D + 128) >> 8;  // 统一降低蓝色系数到420
+            
+            R = clamp(R);
+            G = clamp(G);
+            B = clamp(B);
+            
+            uint16_t p1 = ((R >> 3) << 11) | ((G >> 2) << 5) | (B >> 3);
+            
+            // 根据字节顺序写入
             if(SWAP_RGB565_BYTES){
-                d[0]=(uint8_t)(p0&0xFF); d[1]=(uint8_t)(p0>>8);
-                d[2]=(uint8_t)(p1&0xFF); d[3]=(uint8_t)(p1>>8);
+                // 小端字节顺序 (LSB first)
+                d[0] = (uint8_t)(p0 & 0xFF);
+                d[1] = (uint8_t)(p0 >> 8);
+                d[2] = (uint8_t)(p1 & 0xFF);
+                d[3] = (uint8_t)(p1 >> 8);
             } else {
-                d[0]=(uint8_t)(p0>>8); d[1]=(uint8_t)(p0&0xFF);
-                d[2]=(uint8_t)(p1>>8); d[3]=(uint8_t)(p1&0xFF);
+                // 大端字节顺序 (MSB first)
+                d[0] = (uint8_t)(p0 >> 8);
+                d[1] = (uint8_t)(p0 & 0xFF);
+                d[2] = (uint8_t)(p1 >> 8);
+                d[3] = (uint8_t)(p1 & 0xFF);
             }
             d += 4;
         }
@@ -85,6 +125,40 @@ static void yuv422_to_rgb565(const uint8_t *src, uint8_t *dst, int width, int he
 }
 
 static volatile bool fb_used = false;
+static SemaphoreHandle_t fb_mutex = NULL;
+
+// 获取摄像头帧缓冲区（带互斥锁保护）
+static camera_fb_t* acquire_camera_fb(void) {
+    if (fb_mutex) {
+        xSemaphoreTake(fb_mutex, portMAX_DELAY);
+    } else {
+        while (fb_used) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        fb_used = true;
+    }
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        if (fb_mutex) {
+            xSemaphoreGive(fb_mutex);
+        } else {
+            fb_used = false;
+        }
+    }
+    return fb;
+}
+
+// 释放摄像头帧缓冲区
+static void release_camera_fb(camera_fb_t *fb) {
+    if (fb) {
+        esp_camera_fb_return(fb);
+    }
+    if (fb_mutex) {
+        xSemaphoreGive(fb_mutex);
+    } else {
+        fb_used = false;
+    }
+}
 
 // 精准帧间隔延时
 static inline void delay_frame_us(int frame_interval_us, uint64_t *last_time) {
@@ -102,15 +176,8 @@ static void display_task(void *arg) {
     const int frame_interval_us = 1000000 / DISPLAY_STREAM_FRAME_RATE;
 
     while(1){
-        if(fb_used){
-            vTaskDelay(pdMS_TO_TICKS(1));
-            continue;
-        }
-        fb_used = true;
-
-        camera_fb_t *fb = esp_camera_fb_get();
+        camera_fb_t *fb = acquire_camera_fb();
         if(!fb){
-            fb_used = false;
             delay_frame_us(frame_interval_us, &last_time);
             continue;
         }
@@ -119,8 +186,7 @@ static void display_task(void *arg) {
             size_t rgb_len = fb->width*fb->height*2;
             uint8_t *rgb_buf = heap_caps_malloc(rgb_len, MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
             if(!rgb_buf){
-                esp_camera_fb_return(fb);
-                fb_used = false;
+                release_camera_fb(fb);
                 delay_frame_us(frame_interval_us, &last_time);
                 continue;
             }
@@ -130,17 +196,18 @@ static void display_task(void *arg) {
                                           rgb_buf+i*lines*fb->width*2);
             }
             heap_caps_free(rgb_buf);
+            release_camera_fb(fb);
         } else if(fb->format==PIXFORMAT_RGB565){
             for(int i=0;i<fb->height/lines;i++){
                 esp_lcd_panel_draw_bitmap(panel_handle,0,i*lines,fb->width,(i+1)*lines,
                                           fb->buf+i*lines*fb->width*2);
             }
+            release_camera_fb(fb);
         } else {
             ESP_LOGE(TAG,"Unsupported FB format:%d",fb->format);
+            release_camera_fb(fb);
         }
 
-        esp_camera_fb_return(fb);
-        fb_used=false;
         delay_frame_us(frame_interval_us, &last_time);
     }
 }
@@ -151,15 +218,8 @@ static void stream_task(void *arg){
 
     while(1){
         if(user_config.send_jpeg && user_config.stream_flag && user_config.stream_flag()){
-            if(fb_used){
-                vTaskDelay(pdMS_TO_TICKS(1));
-                continue;
-            }
-
-            fb_used = true;
-            camera_fb_t *fb = esp_camera_fb_get();
+            camera_fb_t *fb = acquire_camera_fb();
             if(!fb){
-                fb_used=false;
                 delay_frame_us(frame_interval_us,&last_time);
                 continue;
             }
@@ -178,8 +238,7 @@ static void stream_task(void *arg){
                 ESP_LOGE(TAG,"Unsupported FB format:%d",fb->format);
             }
 
-            esp_camera_fb_return(fb);
-            fb_used=false;
+            release_camera_fb(fb);
         }
         delay_frame_us(frame_interval_us,&last_time);
     }
@@ -191,15 +250,32 @@ esp_err_t lcd_camera_start(const lcd_camera_config_t *config){
         return ESP_ERR_INVALID_ARG;
     }
 
+    // 创建互斥锁用于帧缓冲区保护
+    fb_mutex = xSemaphoreCreateMutex();
+    if (fb_mutex == NULL) {
+        ESP_LOGE(TAG, "Failed to create mutex");
+        return ESP_FAIL;
+    }
+
     user_config = *config;
     ESP_ERROR_CHECK(esp_camera_init(&camera_config));
+    
 #ifdef LCD_DISPLAY_EN
-    esp_periph_config_t periph_cfg = DEFAULT_ESP_PERIPH_SET_CONFIG();
-    esp_periph_set_handle_t set = esp_periph_set_init(&periph_cfg);
-    panel_handle = audio_board_lcd_init(set,NULL);
-    xTaskCreatePinnedToCore(display_task,"lcd_display",8192,NULL,4,NULL,0);
+    (void)0;
+    esp_lcd_panel_handle_t panel;
+    esp_err_t lcd_ret = board_lcd_init(&panel, NULL);
+    if (lcd_ret == ESP_OK) {
+        panel_handle = panel;
+        ESP_LOGI(TAG, "LCD panel initialized successfully, creating display task");
+        xTaskCreatePinnedToCore(display_task,"lcd_display",8192,NULL,4,NULL,0);
+    } else {
+        ESP_LOGE(TAG, "board_lcd_init failed: %s, LCD display will not work", esp_err_to_name(lcd_ret));
+        // 继续运行但不创建显示任务
+    }
 #endif
+    
     xTaskCreatePinnedToCore(stream_task,"stream_task",8192,NULL,5,NULL,1);
 
+    ESP_LOGI(TAG, "lcd_camera started successfully");
     return ESP_OK;
 }
