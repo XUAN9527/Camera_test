@@ -31,14 +31,6 @@
 
 static const char *TAG = "TCA9554";
 
-/* Simple I2C bus manager to share bus with camera driver */
-typedef struct {
-    i2c_master_bus_handle_t bus_handle;
-    int ref_count;
-} i2c_bus_manager_t;
-
-static i2c_bus_manager_t bus_manager[I2C_NUM_MAX] = {0};
-
 static uint16_t tca9554_addr = 0;
 static i2c_master_bus_handle_t tca_bus = NULL;
 static i2c_master_dev_handle_t tca_dev = NULL;
@@ -152,7 +144,7 @@ esp_err_t tca9554_init(esp_tca9554_config_t *cfg)
 		}
 		
 		for (size_t i = 0; i < sizeof(addrs)/sizeof(addrs[0]); ++i) {
-			if (i2c_master_probe(tca_bus, addrs[i], 1000) == ESP_OK) {
+			if (i2c_master_probe(tca_bus, addrs[i], 100) == ESP_OK) {
 				tca9554_addr = addrs[i];
 				ESP_LOGI(TAG, "Detected IO expander at 0x%02x", tca9554_addr);
 				i2c_device_config_t dev_cfg = {
