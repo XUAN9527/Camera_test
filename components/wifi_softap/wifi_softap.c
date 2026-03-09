@@ -115,6 +115,7 @@ void wifi_user_init() {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+	ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT40)); // AP带宽40MHz
 
     ESP_LOGI(TAG, "WiFi AP started. SSID:%s, IP:" IPSTR, WIFI_AP_SSID, IP2STR(&ip_info.ip));
 #endif
