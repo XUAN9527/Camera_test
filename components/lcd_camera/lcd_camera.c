@@ -20,7 +20,7 @@
 
 #define LCD_H_RES 320
 #define LCD_V_RES 240
-#define DISPLAY_STREAM_FRAME_RATE 15
+#define DISPLAY_STREAM_FRAME_RATE CONFIG_CAMERA_STREAM_FRAME_RATE
 #define DISPLAY_SW_QUALITY 80 // 0~100
 
 static esp_lcd_panel_handle_t panel_handle = NULL;

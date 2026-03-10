@@ -1,0 +1,10 @@
+menu "Example 'Camera Test Project' Config"
+
+    config CAMERA_STREAM_FRAME_RATE
+    int "Camera stream frame rate"
+    default 10
+    help
+        Set the camera/RTSP stream frame rate (fps)
+
+endmenu
+
